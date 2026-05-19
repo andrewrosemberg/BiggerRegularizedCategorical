@@ -1,3 +1,5 @@
 memory.md
 protocol.md
 agent_reports/
+.venv/
+__pycache__/

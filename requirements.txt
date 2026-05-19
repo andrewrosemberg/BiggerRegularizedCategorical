@@ -1,13 +1,17 @@
 numpy==1.26.4
 scipy==1.12.0
-jax[cuda12_pip]==0.4.35 
+jax[cuda12_pip]==0.4.35
 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 flax
+optax
 imageio
 wandb
 wandb[media]
 ml_collections
+absl-py
 Shimmy
-gymnasium==0.29.1
+gymnasium>=1.0.0
+gymnasium-robotics>=1.4.2
+mujoco>=3.0.0
 dm-control
 distrax
