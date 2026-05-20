@@ -119,6 +119,9 @@ def _do_multiple_updates(
     return jax.lax.fori_loop(1, num_updates, one_step, (step, rng, actor, critic, target_critic, temp, info))
 
 class BRC(object):
+
+    VALID_CONDITIONING_MODES = ("categorical", "none", "mesh_shape")
+
     def __init__(
         self,
         seed: int,
@@ -139,8 +142,15 @@ class BRC(object):
         width_actor: int = 256,
         num_bins: int = 101,
         v_max: float = 10.0,
+        conditioning_mode: str = "categorical",
+        conditioner_features: Optional[np.ndarray] = None,
     ) -> None:
-        
+
+        assert conditioning_mode in self.VALID_CONDITIONING_MODES, (
+            f"Unknown conditioning_mode={conditioning_mode!r}; "
+            f"valid: {self.VALID_CONDITIONING_MODES}"
+        )
+
         action_dim = actions.shape[-1]
         self.action_dim = float(action_dim)
         self.seed = seed
@@ -149,25 +159,67 @@ class BRC(object):
         self.discount = discount
         self.num_bins = num_bins
         self.v_max = v_max
-        
+
         self.num_tasks = num_tasks
         self.embedding_size = embedding_size
         self.task_ids = jnp.arange(num_tasks, dtype=jnp.int32)
-        
-        task_embedding_init = jnp.zeros((1, embedding_size))
+        self.conditioning_mode = conditioning_mode
+
         task_ids_init = self.task_ids[:1]
-        self.multitask = True if num_tasks > 1 else False
-        
-        actor_init = jnp.concatenate((observations, task_embedding_init), axis=-1) if self.multitask else observations
-        
+
+        if conditioning_mode == "categorical":
+            self.multitask = True if num_tasks > 1 else False
+            self.conditioner_features = None
+            conditioner_dim = embedding_size if self.multitask else 0
+        elif conditioning_mode == "none":
+            self.multitask = False
+            self.conditioner_features = None
+            conditioner_dim = 0
+        elif conditioning_mode == "mesh_shape":
+            assert conditioner_features is not None, (
+                "mesh_shape mode requires conditioner_features"
+            )
+            assert conditioner_features.shape[0] == num_tasks, (
+                f"conditioner_features has {conditioner_features.shape[0]} rows "
+                f"but num_tasks={num_tasks}"
+            )
+            self.multitask = False
+            self.conditioner_features = jnp.array(conditioner_features, dtype=jnp.float32)
+            conditioner_dim = conditioner_features.shape[1]
+
+        assert not (conditioning_mode != "categorical" and self.multitask), (
+            "Learned categorical embedding must be disabled in non-categorical mode"
+        )
+
+        if conditioning_mode == "categorical":
+            if self.multitask:
+                actor_init = jnp.concatenate(
+                    (observations, jnp.zeros((1, embedding_size))), axis=-1
+                )
+            else:
+                actor_init = observations
+            critic_obs_init = observations
+        elif conditioning_mode == "mesh_shape":
+            actor_init = jnp.concatenate(
+                (observations, jnp.zeros((1, conditioner_dim))), axis=-1
+            )
+            critic_obs_init = jnp.concatenate(
+                (observations, jnp.zeros((1, conditioner_dim))), axis=-1
+            )
+        else:
+            actor_init = observations
+            critic_obs_init = observations
+
+        multitask_for_critic = self.multitask
+
         def _init_models(seed):
             rng = jax.random.PRNGKey(seed)
             rng, actor_key, critic_key, temp_key = jax.random.split(rng, 4)
             actor_def = NormalTanhPolicy(action_dim=action_dim, hidden_dims=width_actor)
-            critic_def = Critic(num_tasks=num_tasks, embedding_size=embedding_size, ensemble_size=ensemble_size, hidden_dims=width_critic, depth=2, output_nodes=num_bins, multitask=self.multitask)
+            critic_def = Critic(num_tasks=num_tasks, embedding_size=embedding_size, ensemble_size=ensemble_size, hidden_dims=width_critic, depth=2, output_nodes=num_bins, multitask=multitask_for_critic)
             actor = Model.create(actor_def, inputs=[actor_key, actor_init], tx=optax.adamw(learning_rate=actor_lr))
-            critic = Model.create(critic_def, inputs=[critic_key, observations, actions, task_ids_init], tx=optax.adamw(learning_rate=critic_lr))
-            target_critic = Model.create(critic_def, inputs=[critic_key, observations, actions, task_ids_init])
+            critic = Model.create(critic_def, inputs=[critic_key, critic_obs_init, actions, task_ids_init], tx=optax.adamw(learning_rate=critic_lr))
+            target_critic = Model.create(critic_def, inputs=[critic_key, critic_obs_init, actions, task_ids_init])
             temp = Model.create(Temperature(init_temperature), inputs=[temp_key], tx=optax.adam(learning_rate=temp_lr, b1=0.5))
             return actor, critic, target_critic, temp, rng
 
@@ -175,7 +227,32 @@ class BRC(object):
         self.actor, self.critic, self.target_critic, self.temp, self.rng = self.init_models(self.seed)
         self.step = 1
 
+    def _augment_obs(self, observations, task_ids):
+        if self.conditioner_features is None:
+            return observations
+        features = self.conditioner_features[task_ids]
+        return jnp.concatenate((observations, features), axis=-1)
+
+    def _augment_batch(self, batch: Batch) -> Batch:
+        if self.conditioner_features is None:
+            return batch
+        obs = jnp.concatenate(
+            (batch.observations, self.conditioner_features[batch.task_ids]), axis=-1
+        )
+        next_obs = jnp.concatenate(
+            (batch.next_observations, self.conditioner_features[batch.task_ids]), axis=-1
+        )
+        return Batch(
+            observations=obs,
+            actions=batch.actions,
+            rewards=batch.rewards,
+            masks=batch.masks,
+            next_observations=next_obs,
+            task_ids=batch.task_ids,
+        )
+
     def sample_actions(self, observations: np.ndarray, temperature: float = 1.0):
+        observations = self._augment_obs(observations, self.task_ids)
         inputs = build_actor_input(self.critic, observations, self.task_ids, self.multitask)
         rng, actions = _sample_actions(self.rng, self.actor, inputs, temperature)
         self.rng = rng
@@ -183,6 +260,7 @@ class BRC(object):
         return np.clip(actions, -1, 1)
     
     def update(self, batch: Batch, num_updates: int, env_step: int):
+        batch = self._augment_batch(batch)
 
         step, rng, actor, critic, target_critic, temp, info = _do_multiple_updates(
             self.rng,
@@ -209,7 +287,8 @@ class BRC(object):
         return info
     
     def get_infos(self, batch: Batch):
-        infos = _get_infos(            
+        batch = self._augment_batch(batch)
+        infos = _get_infos(
                     self.rng,
                     self.actor,
                     self.critic,

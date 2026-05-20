@@ -1,4 +1,5 @@
 import os
+import sys
 
 os.environ['MUJOCO_GL'] = 'egl'
 
@@ -26,6 +27,10 @@ flags.DEFINE_boolean('offline_evaluation', True, 'Whether to perform evaluations
 flags.DEFINE_boolean('render', True, 'Whether to log the rendering to wandb.')
 flags.DEFINE_integer('updates_per_step', 2, 'Number of updates per step.')
 flags.DEFINE_integer('width_critic', 4096, 'Width of the critic network.')
+flags.DEFINE_string('conditioning_mode', 'categorical',
+                    'Task conditioning: categorical | none | mesh_shape.')
+flags.DEFINE_string('split_manifest', None,
+                    'Path to split manifest JSON (required for mesh_shape).')
         
 def main(_):
     if FLAGS.log_to_wandb:
@@ -51,8 +56,22 @@ def main(_):
     kwargs = {}
     kwargs['updates_per_step'] = FLAGS.updates_per_step
     kwargs['width_critic'] = FLAGS.width_critic
-    
+    kwargs['conditioning_mode'] = FLAGS.conditioning_mode
+
     num_tasks = len(env.envs)
+
+    if FLAGS.conditioning_mode == 'mesh_shape':
+        if not FLAGS.split_manifest:
+            print("Error: --split_manifest is required when conditioning_mode=mesh_shape",
+                  file=sys.stderr)
+            sys.exit(1)
+        from jaxrl.mesh_conditioner import build_conditioner_features_from_manifest
+        import dex_envs
+        assets_dir = os.path.join(os.path.dirname(dex_envs.__file__), 'assets')
+        conditioner_features, conditioner_meta = build_conditioner_features_from_manifest(
+            env_names, assets_dir, FLAGS.split_manifest,
+        )
+        kwargs['conditioner_features'] = conditioner_features
 
     agent = BRC(
         FLAGS.seed,
@@ -62,7 +81,7 @@ def main(_):
         **kwargs,
     )
     
-    batch_size = 1024 if agent.multitask else 256
+    batch_size = 1024 if num_tasks > 1 else 256
 
     replay_buffer = ParallelReplayBuffer(env.observation_space, env.action_space.shape[-1], FLAGS.replay_buffer_size, num_tasks=num_tasks)   
     

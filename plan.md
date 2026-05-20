@@ -482,7 +482,23 @@ implementation should be compatible with the existing BRC code style:
 - avoid hidden object-name lookup in the policy path;
 - save conditioner metadata with every policy run.
 
-The implementation should also include object metadata utilities:
+The first implementation slice should establish the shared BRC conditioning
+plumbing before adding the full learned encoders. In particular, it should:
+
+- preserve categorical behavior as the default diagnostic baseline;
+- add `none` as an ablation mode;
+- add an initial `mesh_shape` mode with deterministic mesh features, so the
+  policy path can be tested before a learned mesh encoder exists;
+- require the canonical split manifest for geometry-conditioned runs that need
+  train-split-only normalization;
+- keep multi-object batch sizing tied to the number of tasks rather than to the
+  presence of a learned categorical embedding.
+
+The first implementation slice is not complete until smoke tests verify action
+sampling, replay-buffer updates, diagnostics, and one-step `train.py` execution
+for the new conditioning path.
+
+The remaining infrastructure should include object metadata utilities:
 
 - object name to XML path;
 - object name to mesh path;
@@ -490,12 +506,48 @@ The implementation should also include object metadata utilities:
 - optional current pose extraction from the environment;
 - raycast pointcloud extraction or generation.
 
-The raycast path needs special attention because Gymnasium Robotics environments
-may not expose the same raycast sensor interface used in other simulators. If the
-current XMLs do not include the needed camera or ray sensor, we should add the
-minimal XML/site/sensor support required to generate the wrist-raycast pointcloud.
+### Phase 4: Wrist-Raycast Sensor Integration and Visual Validation
 
-### Phase 4: PointNet Training in This Repository
+Implement the wrist-raycast path before launching geometry-conditioned policy
+experiments. This phase is required because the wrist-raycast embedding is one of
+the two main methods under test and the preferred deployable candidate.
+
+The raycast path needs special attention because Gymnasium Robotics environments
+may not expose a ready-made raycast sensor interface for the current ShadowHand
+wrapper. If the current XMLs do not include the needed camera, site, or sensor
+support, add the minimal MuJoCo XML and wrapper support required to generate the
+wrist-raycast pointcloud.
+
+This phase should deliver:
+
+- a documented wrist/palm-mounted camera or site using the pose in Section 5.1
+  unless a measured repository-specific correction is justified;
+- a deterministic 2-D ray grid, initially 16 by 16 rays with max distance
+  0.34 m;
+- pointcloud output in a clearly documented coordinate frame, with a transform to
+  the palm frame for policy conditioning;
+- hit masks or equivalent metadata distinguishing valid ray hits from misses;
+- tests covering output shape, finite values, frame conventions, deterministic
+  reset behavior, and at least three different objects;
+- a `wrist_raycast` conditioning-mode scaffold only after the raw pointcloud path
+  has been validated.
+
+As a visual sanity check, this phase must generate diagnostic figures for three
+randomly selected train-split objects, recording the random seed and object names.
+Each object must have one figure with three views:
+
+1. a bird's-eye rendered view of the full hand-object scene;
+2. the wrist-camera RGB view used to define the ray grid;
+3. the raycast pointcloud of the camera-visible geometry, rendered from the same
+   bird's-eye viewpoint as the scene view.
+
+The pointcloud panel should report hit count and total ray count, color points by
+distance to the wrist camera when useful, and use axis labels that state the
+coordinate frame. These figures are not a quantitative result; they are a guard
+against wrong camera placement, flipped frames, empty raycasts, and accidental use
+of the wrong geometry.
+
+### Phase 5: PointNet Training in This Repository
 
 Add a path to train geometry encoders inside this repository.
 
@@ -519,7 +571,7 @@ Because this repository is JAX/Flax-based, the default implementation should pre
 Flax/JAX unless dependency or MuJoCo integration constraints make a small additional
 dependency clearly better.
 
-### Phase 5: Multi-Object BRC Policy Training
+### Phase 6: Multi-Object BRC Policy Training
 
 Train and evaluate the following policies on the existing 85/29 split:
 
@@ -555,7 +607,7 @@ Evaluation must report, at minimum:
 - wall-clock time and environment steps;
 - exact object split and conditioner checkpoint.
 
-### Phase 6: Single-Object BRC Policy Training
+### Phase 7: Single-Object BRC Policy Training
 
 After the multi-object runs, select seven objects from the 85-object train split.
 The selection should cover easy, medium, and hard cases and should be recorded
@@ -626,14 +678,14 @@ the bottleneck.
 
 ## 11. Immediate Next Actions
 
-1. Install the repository in an isolated environment and identify missing
-   dependencies.
-2. Run the ShadowHand smoke tests listed in Phase 1.
-3. Export the existing 85/29 object split manifest.
-4. Add a geometry-conditioning switch to BRC without changing algorithm behavior
-   for the existing categorical baseline.
-5. Implement and test the mesh shape-only embedding first, because it is simpler
-   than wrist raycasting and exercises the external conditioner path.
-6. Implement wrist-raycast collection and PointNet training.
-7. Launch the first small two- or three-object geometry-conditioned BRC pilot before
-   attempting the full 85-object run.
+1. Treat Phases 1 and 2 as complete after verification of the working environment
+   and the canonical 85/29 split manifest.
+2. Treat the first slice of Phase 3 as complete after committing the
+   geometry-conditioning switch, the `none` ablation, the initial `mesh_shape`
+   path, manifest-enforced train-split normalization, and smoke tests.
+3. Start Phase 4 next. Do not skip to PointNet training or policy training before
+   wrist-raycast extraction and the three-object visual sanity check are working.
+4. After Phase 4 is approved, train the wrist-raycast and mesh encoders under the
+   same split discipline.
+5. Launch the first small two- or three-object geometry-conditioned BRC pilot only
+   after both embedding families have validated conditioning paths.
