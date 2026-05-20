@@ -120,7 +120,9 @@ def _do_multiple_updates(
 
 class BRC(object):
 
-    VALID_CONDITIONING_MODES = ("categorical", "none", "mesh_shape")
+    VALID_CONDITIONING_MODES = (
+        "categorical", "none", "mesh_shape", "wrist_raycast", "mesh_pose",
+    )
 
     def __init__(
         self,
@@ -186,6 +188,10 @@ class BRC(object):
             self.multitask = False
             self.conditioner_features = jnp.array(conditioner_features, dtype=jnp.float32)
             conditioner_dim = conditioner_features.shape[1]
+        elif conditioning_mode in ("wrist_raycast", "mesh_pose"):
+            self.multitask = False
+            self.conditioner_features = None
+            conditioner_dim = 0
 
         assert not (conditioning_mode != "categorical" and self.multitask), (
             "Learned categorical embedding must be disabled in non-categorical mode"
@@ -209,6 +215,8 @@ class BRC(object):
         else:
             actor_init = observations
             critic_obs_init = observations
+
+        self._online_conditioned = conditioning_mode in ("wrist_raycast", "mesh_pose")
 
         multitask_for_critic = self.multitask
 

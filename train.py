@@ -3,6 +3,7 @@ import sys
 
 os.environ['MUJOCO_GL'] = 'egl'
 
+import numpy as np
 from absl import app, flags
 
 from jaxrl.agent.brc_learner import BRC
@@ -28,9 +29,11 @@ flags.DEFINE_boolean('render', True, 'Whether to log the rendering to wandb.')
 flags.DEFINE_integer('updates_per_step', 2, 'Number of updates per step.')
 flags.DEFINE_integer('width_critic', 4096, 'Width of the critic network.')
 flags.DEFINE_string('conditioning_mode', 'categorical',
-                    'Task conditioning: categorical | none | mesh_shape.')
+                    'Task conditioning: categorical | none | mesh_shape | wrist_raycast | mesh_pose.')
 flags.DEFINE_string('split_manifest', None,
                     'Path to split manifest JSON (required for mesh_shape).')
+flags.DEFINE_integer('conditioner_embed_dim', 64,
+                     'Embedding dimension for online conditioners (wrist_raycast, mesh_pose).')
         
 def main(_):
     if FLAGS.log_to_wandb:
@@ -60,6 +63,8 @@ def main(_):
 
     num_tasks = len(env.envs)
 
+    online_conditioner = None
+
     if FLAGS.conditioning_mode == 'mesh_shape':
         if not FLAGS.split_manifest:
             print("Error: --split_manifest is required when conditioning_mode=mesh_shape",
@@ -73,9 +78,36 @@ def main(_):
         )
         kwargs['conditioner_features'] = conditioner_features
 
+    elif FLAGS.conditioning_mode == 'wrist_raycast':
+        from jaxrl.online_conditioner import build_raycast_conditioner
+        online_conditioner = build_raycast_conditioner(
+            seed=FLAGS.seed, output_dim=FLAGS.conditioner_embed_dim,
+        )
+
+    elif FLAGS.conditioning_mode == 'mesh_pose':
+        from jaxrl.mesh_conditioner import build_mesh_pose_conditioner
+        import dex_envs
+        assets_dir = os.path.join(os.path.dirname(dex_envs.__file__), 'assets')
+        if not FLAGS.split_manifest:
+            print("Error: --split_manifest is required when conditioning_mode=mesh_pose",
+                  file=sys.stderr)
+            sys.exit(1)
+        online_conditioner = build_mesh_pose_conditioner(
+            env_names, assets_dir, FLAGS.split_manifest,
+            seed=FLAGS.seed, embed_dim=FLAGS.conditioner_embed_dim,
+        )
+
+    obs_sample = env.observation_space.sample()[:1]
+    if online_conditioner is not None:
+        import numpy as _np
+        obs_sample = _np.concatenate(
+            [obs_sample, _np.zeros((1, online_conditioner.embed_dim), dtype=_np.float32)],
+            axis=-1,
+        )
+
     agent = BRC(
         FLAGS.seed,
-        env.observation_space.sample()[:1],
+        obs_sample,
         env.action_space.sample()[:1],
         num_tasks=num_tasks,
         **kwargs,
@@ -83,23 +115,41 @@ def main(_):
     
     batch_size = 1024 if num_tasks > 1 else 256
 
-    replay_buffer = ParallelReplayBuffer(env.observation_space, env.action_space.shape[-1], FLAGS.replay_buffer_size, num_tasks=num_tasks)   
-    
+    if online_conditioner is not None:
+        import gymnasium as _gym
+        aug_dim = env.observation_space.shape[-1] + online_conditioner.embed_dim
+        aug_obs_space = _gym.spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(num_tasks, aug_dim), dtype=np.float32,
+        )
+        replay_buffer = ParallelReplayBuffer(aug_obs_space, env.action_space.shape[-1], FLAGS.replay_buffer_size, num_tasks=num_tasks)
+    else:
+        replay_buffer = ParallelReplayBuffer(env.observation_space, env.action_space.shape[-1], FLAGS.replay_buffer_size, num_tasks=num_tasks)
+
     reward_normalizer = RewardNormalizer(num_tasks, target_entropy=agent.target_entropy, discount=agent.discount)
-        
+
     statistics_recorder = EpisodeRecorder(num_tasks)
-    
-    observations = env.reset()
+
+    def _augment_obs(raw_obs):
+        if online_conditioner is None:
+            return raw_obs
+        embeddings = online_conditioner.extract_and_encode(env.envs)
+        return np.concatenate([raw_obs, embeddings], axis=-1)
+
+    observations = _augment_obs(env.reset())
 
     for i in range(1, FLAGS.max_steps + 1):
         actions = env.action_space.sample() if i < FLAGS.start_training else agent.sample_actions(observations, temperature=1.0)
-        next_observations, rewards, terms, truns, goals = env.step(actions)
+        next_raw_obs, rewards, terms, truns, goals = env.step(actions)
+        next_observations = _augment_obs(next_raw_obs)
         reward_normalizer.update(rewards, terms, truns)
         statistics_recorder.update(rewards, goals, terms, truns)
         masks = env.generate_masks(terms, truns)
         replay_buffer.insert(observations, actions, rewards, masks, next_observations)
         observations = next_observations
-        observations, terms, truns = env.reset_where_done(observations, terms, truns)
+        raw_obs_after_reset = observations[:, :env.observation_space.shape[-1]]
+        raw_obs_after_reset, terms, truns = env.reset_where_done(raw_obs_after_reset, terms, truns)
+        observations = _augment_obs(raw_obs_after_reset)
         if i >= FLAGS.start_training:
             batches = replay_buffer.sample(batch_size, FLAGS.updates_per_step)
             batches = reward_normalizer.normalize(batches, agent.get_temperature())

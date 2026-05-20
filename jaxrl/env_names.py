@@ -336,6 +336,8 @@ def get_environment_list(env_names: str | list):
     if isinstance(env_names, str):
         if env_names in EnvironmentsDict.keys():
             return EnvironmentsDict[env_names]
+        elif ',' in env_names:
+            return [n.strip() for n in env_names.split(',') if n.strip()]
         else:
             return [env_names]
     elif isinstance(env_names, list):

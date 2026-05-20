@@ -1,9 +1,40 @@
-"""Deterministic mesh-based shape conditioning for geometry-conditioned BRC.
+"""Mesh-based conditioning for geometry-conditioned BRC.
 
-The features here are hand-designed placeholders for the conditioning
-infrastructure.  The interface is designed so a learned PointNet embedding
-can replace them later without changing the BRC plumbing.
+Provides:
+
+- Deterministic 8D mesh descriptors (Phase 3 placeholder, still valid for
+  ``mesh_shape`` mode until a learned PointNet replaces them).
+- ``MeshPoseConditioner``: online conditioner for ``mesh_pose`` mode.
+  Combines static mesh-shape embeddings with per-step object pose
+  variables extracted from the simulator.
+
+Mesh-pose design decision
+--------------------------
+The ``mesh_pose`` conditioner uses **structured append**: the per-step
+conditioning vector is ``[z_m, p_t, rot6d(R_t)]`` where
+
+- ``z_m`` is the static mesh-shape embedding (same as ``mesh_shape``),
+- ``p_t`` is the object position in palm frame (3D),
+- ``rot6d(R_t)`` is the object orientation in palm frame encoded as the
+  first two columns of the rotation matrix (6D).
+
+This representation was chosen over re-encoding transformed mesh points
+because:
+
+1. It clearly separates static shape from dynamic pose.
+2. It makes the privileged information (simulator object pose) explicit
+   and auditable.
+3. The mesh-shape encoder is shared with ``mesh_shape`` mode.
+4. Appending 9 pose dimensions is cheaper than running a second PointNet
+   on transformed mesh vertices every step.
+
+**Privileged information label**: ``mesh_pose`` uses simulator object pose
+directly.  Results from this mode must be labeled *privileged* or
+*upper-bound* unless an equivalent real-time pose estimation pipeline is
+demonstrated.
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -175,3 +206,115 @@ def load_manifest_objects(manifest_path: str, split: str = "train") -> list[str]
     with open(manifest_path) as f:
         manifest = json.load(f)
     return manifest[split]
+
+
+# ---------------------------------------------------------------------------
+# Mesh-pose conditioner (privileged: uses simulator object pose)
+# ---------------------------------------------------------------------------
+
+POSE_DIM = 9  # position (3) + rot6d (6)
+PALM_BODY_NAME = "robot0:palm"
+
+
+def _rot6d(rotation_matrix: np.ndarray) -> np.ndarray:
+    """Extract 6D rotation representation (first two columns of R)."""
+    return rotation_matrix[:, :2].flatten()
+
+
+def extract_object_pose_palm_frame(env) -> np.ndarray:
+    """Extract object position and rotation in palm frame from a live env.
+
+    Returns a 9D vector: [palm-frame position (3), rot6d (6)].
+    """
+    import mujoco
+
+    uw = env.unwrapped
+    model, data = uw.model, uw.data
+
+    palm_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, PALM_BODY_NAME)
+    palm_pos = data.xpos[palm_id]
+    palm_xmat = data.xmat[palm_id].reshape(3, 3)
+
+    obj_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "object")
+    if obj_id < 0:
+        obj_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "object:joint")
+    if obj_id < 0:
+        for i in range(model.nbody):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)
+            if name and "object" in name.lower():
+                obj_id = i
+                break
+    assert obj_id >= 0, "Could not find object body in model"
+
+    obj_pos_world = data.xpos[obj_id]
+    obj_xmat_world = data.xmat[obj_id].reshape(3, 3)
+
+    pos_palm = palm_xmat.T @ (obj_pos_world - palm_pos)
+    rot_palm = palm_xmat.T @ obj_xmat_world
+    rot6d = _rot6d(rot_palm)
+
+    return np.concatenate([pos_palm, rot6d]).astype(np.float32)
+
+
+class MeshPoseConditioner:
+    """Online conditioner that appends pose variables to mesh-shape embeddings.
+
+    The embedding for each task at step t is::
+
+        c_t = [z_m, p_t / pos_scale, rot6d(R_t)]
+
+    where z_m is the static mesh-shape feature and (p_t, R_t) are extracted
+    from the simulator.
+
+    Attributes
+    ----------
+    embed_dim : int
+        Total embedding dimension = mesh_feature_dim + POSE_DIM.
+    """
+
+    def __init__(
+        self,
+        shape_features: np.ndarray,
+        pos_scale: float = 0.34,
+    ):
+        self.shape_features = shape_features.astype(np.float32)
+        self.pos_scale = pos_scale
+        self.embed_dim = shape_features.shape[1] + POSE_DIM
+
+    def extract_and_encode(self, envs: list) -> np.ndarray:
+        """Compute per-task mesh-pose embeddings from live environments.
+
+        Parameters
+        ----------
+        envs : list of gym.Env
+
+        Returns
+        -------
+        embeddings : (num_envs, embed_dim) float32
+        """
+        embeddings = []
+        for i, env in enumerate(envs):
+            pose = extract_object_pose_palm_frame(env)
+            pose[:3] /= self.pos_scale
+            emb = np.concatenate([self.shape_features[i], pose])
+            embeddings.append(emb)
+        return np.stack(embeddings)
+
+
+def build_mesh_pose_conditioner(
+    object_names: list[str],
+    assets_dir: str,
+    manifest_path: str,
+    seed: int = 0,
+    embed_dim: int = 64,
+) -> MeshPoseConditioner:
+    """Build a MeshPoseConditioner with manifest-normalized mesh features.
+
+    The ``embed_dim`` argument is accepted for API symmetry with the raycast
+    conditioner but is not used: the mesh-pose embedding dimension is
+    ``MESH_FEATURE_DIM + POSE_DIM``.
+    """
+    features, _meta = build_conditioner_features_from_manifest(
+        object_names, assets_dir, manifest_path,
+    )
+    return MeshPoseConditioner(shape_features=features)
