@@ -84,12 +84,27 @@ first engineering task after these planning documents are created.
 ## 3. Scientific Question
 
 Let $m$ denote a manipulated object, $s_t$ the full environment state at time
-$t$, $o_t$ the policy observation, $a_t$ the action, and $c_t(m)$ an
-object-conditioning vector. We need to learn a policy
+$t$, $o_t$ the policy observation, $a_t$ the action, and $c_t$ a geometry
+conditioning vector. We need to learn a policy
 $$
-\pi(a_t \mid o_t, c_t(m))
+\pi(a_t \mid o_t, c_t)
 $$
 that works across a training set of objects and transfers to held-out objects.
+
+For dynamic geometry observations, the conditioner must be online:
+$$
+c_t = E_\theta(x_t),
+$$
+where $x_t$ is the current geometry input available at policy time. For a
+wrist-raycast policy, $x_t$ is the current visible pointcloud and its valid-hit
+mask. For mesh-pose, $x_t$ is the current pose-aware mesh representation.
+Shape-only mesh is static: its input is the canonical mesh, so the same encoder
+can compute one fixed vector $c(m)$ per object without using object identity as
+the conditioner.
+
+Cached per-object wrist-raycast embeddings are not part of the main method. They
+would replace the current sensor observation with an object-level summary and
+would not test the intended state-and-shape conditioner.
 
 The central question is:
 
@@ -167,17 +182,27 @@ configuration as context.
 
 ### 5.2 Mathematical Definition
 
-Let
+The ray grid has a fixed size, but some rays miss all geometry. Let
 $$
-P_t = \{(x_i, n_i)\}_{i=1}^{N}
+P_t = \{(x_i, n_i, \delta_i)\}_{i=1}^{N}
 $$
-be the wrist-raycast pointcloud at time $t$, transformed into palm frame and
-scaled by $s_x$. A single-stream PointNet encoder computes
+be the wrist-raycast tensor at time $t$, transformed into palm frame and scaled
+by $s_x$. Here $x_i \in \mathbb{R}^3$ is the hit point, $n_i \in \mathbb{R}^3$
+is an optional normal, and $\delta_i \in \{0,1\}$ marks whether ray $i$ hit valid
+geometry.
+
+A single-stream PointNet encoder computes per-ray features
+$$
+g_i = f_\theta([x_i / s_x, n_i]),
+$$
+then pools only valid hits:
 $$
 h_t = T_\theta(P_t)
-    = \max_{i=1,\ldots,N} f_\theta([x_i / s_x, n_i]),
+    = \max_{i:\delta_i=1} g_i,
 $$
-where $f_\theta$ is a shared per-point MLP and the max is channelwise.
+where the max is channelwise. In implementation, invalid rays are assigned
+$-\infty$ before max pooling. This keeps the tensor shape fixed while preventing
+missed rays from acting like real surface points.
 
 The encoder adds structured prediction heads:
 $$
@@ -391,9 +416,11 @@ z_m = \phi_\psi(Q_m),
 $$
 where $\phi_\psi$ is a PointNet-style mesh encoder. The policy receives
 $$
-c_t(m) = z_m.
+c_t = z_m.
 $$
-This vector is constant throughout an episode.
+This vector is constant throughout an episode. It may be cached after applying
+the encoder to the mesh because the mesh is static; it must not be replaced by a
+learned object-id table.
 
 For shape-plus-pose conditioning, let $p_t^m$ and $R_t^m$ be the object position
 and orientation in palm frame. The direct structured version is
@@ -413,7 +440,9 @@ $$
 
 The direct structured version is easier to audit. The transformed-pointcloud version
 is closer in form to the wrist-raycast embedding but uses complete mesh
-information instead of a partial sensor view.
+information instead of a partial sensor view. If simulator pose provides
+$p_t^m$ or $R_t^m$, the result is a privileged upper bound unless an equivalent
+real pose-estimation pipeline is supplied.
 
 ### 6.3 Why Pose Matters
 
@@ -535,8 +564,7 @@ This phase should deliver:
 
 - a documented wrist/palm-mounted camera or site using the pose in Section 5.1
   unless a measured repository-specific correction is justified;
-- a deterministic 2-D ray grid, initially 16 by 16 rays with max distance
-  0.34 m;
+- a deterministic 2-D ray grid with max distance 0.34 m;
 - pointcloud output in a clearly documented coordinate frame, with a transform to
   the palm frame for policy conditioning;
 - hit masks or equivalent metadata distinguishing valid ray hits from misses;
@@ -560,11 +588,50 @@ coordinate frame. These figures are not a quantitative result; they are a guard
 against wrong camera placement, flipped frames, empty raycasts, and accidental use
 of the wrong geometry.
 
-### Phase 5: PointNet Training in This Repository
+### Phase 5: Online Conditioner Interface
+
+Before training the learned encoders, define and test the online conditioner
+interface that BRC will use. This phase prevents the learned embedding work from
+quietly drifting into cached object-level features.
+
+The key contract is:
+
+$$
+c_t = E_\theta(x_t),
+$$
+
+where $x_t$ is the current geometry input at policy time. For the wrist-raycast
+conditioner, $x_t$ is the current raycast pointcloud and hit mask. For mesh-pose,
+$x_t$ is the current transformed mesh representation. Shape-only mesh is the only
+main exception: because the canonical object mesh is static during an episode, its
+shape embedding can be computed once per object by applying the same encoder to
+that object's mesh.
+
+This phase should:
+
+- define the raycast point tensor, valid-hit mask, coordinate frame, normal and
+  distance channels, and normalization constants;
+- implement mask-aware PointNet-style pooling so invalid ray slots do not behave
+  as real surface points;
+- add a `wrist_raycast` BRC conditioning mode that computes features from the
+  current raycast observation online;
+- explicitly forbid cached per-object wrist-raycast embeddings for the main
+  deployable method;
+- define the mesh conditioner interface for both shape-only and mesh-pose modes;
+- decide what information mesh-pose may use, and label it privileged if it depends
+  on simulator object pose;
+- add one-step smoke tests proving that BRC can initialize and step with
+  `wrist_raycast` without learned categorical task embeddings.
+
+### Phase 6: PointNet Training in This Repository
 
 Add a path to train geometry encoders and feed their fixed-size outputs into BRC
-inside this repository. This phase should validate the encoder and policy-input
-interfaces before launching full reinforcement-learning runs.
+inside this repository. This phase trains two learned encoders:
+
+1. a wrist-raycast PointNet that maps current wrist pointcloud observations to
+   online policy-conditioning vectors;
+2. a mesh PointNet that maps sampled mesh geometry to shape embeddings, and whose
+   pose-conditioned variant is specified by the mesh-pose decision from Phase 5.
 
 Wrist-raycast PointNet training should:
 
@@ -572,11 +639,12 @@ Wrist-raycast PointNet training should:
 - train state and shape heads with the structured raycast loss;
 - save both the feature encoder and the full supervised checkpoint;
 - evaluate offline metrics on train and held-out objects separately;
-- record whether the policy will consume trunk features, structured heads, or both.
+- record whether the policy will consume trunk features, structured heads, or both;
 - define the exact point tensor shape, mask convention, coordinate frame, and
   normalization constants used by the encoder;
-- add a `wrist_raycast` conditioning mode that loads a trained encoder or cached
-  features without reintroducing a learned object-id lookup;
+- load trained encoder parameters into the online `wrist_raycast` conditioning
+  path without reintroducing a learned object-id lookup or cached per-object
+  raycast feature;
 - save conditioner metadata with the BRC run: encoder checkpoint path, manifest
   path, pointcloud configuration, feature dimension, and normalization statistics;
 - run a one-step BRC smoke test for `wrist_raycast`, analogous to the
@@ -586,7 +654,13 @@ Mesh PointNet training should:
 
 - sample object meshes consistently;
 - train a shape encoder without object-name lookup at inference;
-- optionally train a transformed-mesh state encoder for the mesh-pose upper bound;
+- train the shape-only mesh encoder as a separate PointNet from the wrist-raycast
+  encoder;
+- decide and implement the mesh-pose encoding: either append pose variables to
+  the mesh-shape embedding, or encode mesh points transformed into the current
+  palm/object pose with a PointNet;
+- explicitly mark mesh-pose results as privileged if simulator object pose is
+  used;
 - evaluate train and held-out mesh embeddings without policy training on held-out
   objects.
 
@@ -594,7 +668,7 @@ Because this repository is JAX/Flax-based, the default implementation should pre
 Flax/JAX unless dependency or MuJoCo integration constraints make a small additional
 dependency clearly better.
 
-### Phase 6: Multi-Object BRC Policy Training
+### Phase 7: Multi-Object BRC Policy Training
 
 Train and evaluate the following policies on the existing 85/29 split:
 
@@ -630,7 +704,7 @@ Evaluation must report, at minimum:
 - wall-clock time and environment steps;
 - exact object split and conditioner checkpoint.
 
-### Phase 7: Single-Object BRC Policy Training
+### Phase 8: Single-Object BRC Policy Training
 
 After the multi-object runs, select seven objects from the 85-object train split.
 The selection should cover easy, medium, and hard cases and should be recorded
@@ -709,8 +783,10 @@ the bottleneck.
 3. Treat Phase 4 as complete after committing the wrist-raycast pointcloud path,
    ShadowHand camera/site support, smoke tests, and three-object visual sanity
    check.
-4. Start Phase 5 next: implement encoder training/loading and the
-   `wrist_raycast` BRC conditioning path, including checkpoint metadata and a
-   one-step BRC smoke test.
-5. Launch the first small two- or three-object geometry-conditioned BRC pilot only
+4. Start Phase 5 next: define and smoke-test the online conditioner interface for
+   `wrist_raycast`, mesh shape, and mesh pose. Do not use cached per-object
+   wrist-raycast embeddings as the main method.
+5. In Phase 6, train the wrist-raycast PointNet and mesh PointNet, and implement
+   the chosen mesh-pose representation.
+6. Launch the first small two- or three-object geometry-conditioned BRC pilot only
    after both embedding families have validated conditioning paths.
