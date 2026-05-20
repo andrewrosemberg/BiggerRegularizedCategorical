@@ -137,14 +137,21 @@ ShadowHand-calibrated camera model uses these concrete values:
 - camera name: `pointnet_camera`;
 - position in parent frame: `(0.0024, -0.2019, -0.0613)`;
 - quaternion in parent frame: `(0.466397, 0.884213, 0.016008, -0.019628)`;
-- field of view: 60 deg;
-- default ray grid for policy conditioning: 16 by 16 rays, giving 256 points;
+- field of view: 40 deg;
+- default ray grid for policy conditioning: 32 by 32 rays, giving 1024 points;
 - max ray distance: 0.34 m.
 
 This pose was chosen for the current ShadowHand assets because it places the
 camera above the wrist/palm and points it toward objects held by the fingers. A
 hand-specific calibration is necessary: a plausible pose for one hand model can
 be inside the forearm or miss the grasped object on another hand model.
+
+The raycast settings were selected by a sensor sweep over 13 train-split objects
+and five random initializations per object. The selected `32x32`, 40 deg setting
+averaged 462.7 valid hits and 220.4 object-geometry hits from 1024 rays, compared
+with 59.2 valid hits and 28.2 object hits for the initial `16x16`, 60 deg smoke
+setting. The tracked analysis figures and summary are in
+`docs/raycast_sensor_sweep/`.
 
 The pointcloud is expressed in the palm frame. If normals are available, each point
 is represented as $(x_i, n_i)$, where $x_i \in \mathbb{R}^3$ is position and

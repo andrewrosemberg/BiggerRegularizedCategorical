@@ -76,18 +76,22 @@ def test_01_imports():
 
 
 def test_02_ray_grid_shape():
-    """The default 16x16 pinhole grid should produce 256 camera-frame rays."""
-    from jaxrl.raycast_conditioner import generate_ray_grid
+    """The default pinhole grid should produce 1024 camera-frame rays."""
+    from jaxrl.raycast_conditioner import RaycastConfig, generate_ray_grid
 
-    dirs = generate_ray_grid(16, 16, 60.0)
-    assert dirs.shape == (256, 3), f"Expected (256, 3), got {dirs.shape}"
+    config = RaycastConfig()
+    dirs = generate_ray_grid(config.grid_h, config.grid_w, config.fovy_deg)
+    assert config.grid_h == 32
+    assert config.grid_w == 32
+    assert config.fovy_deg == 40.0
+    assert dirs.shape == (1024, 3), f"Expected (1024, 3), got {dirs.shape}"
 
 
 def test_03_ray_grid_unit_vectors():
     """Ray directions should be normalized before passing them to MuJoCo."""
     from jaxrl.raycast_conditioner import generate_ray_grid
 
-    dirs = generate_ray_grid(16, 16, 60.0)
+    dirs = generate_ray_grid(32, 32, 40.0)
     norms = np.linalg.norm(dirs, axis=1)
     assert np.allclose(norms, 1.0, atol=1e-10), f"Norms not unit: {norms.min()}, {norms.max()}"
 
@@ -96,8 +100,8 @@ def test_04_ray_grid_center_points_neg_z():
     """MuJoCo cameras look along the negative camera z axis."""
     from jaxrl.raycast_conditioner import generate_ray_grid
 
-    dirs = generate_ray_grid(16, 16, 60.0)
-    center = dirs[16 * 8 + 8]
+    dirs = generate_ray_grid(32, 32, 40.0)
+    center = dirs[32 * 16 + 16]
     assert center[2] < -0.9, f"Center ray z={center[2]}, expected < -0.9 (MuJoCo camera looks along -z)"
 
 
@@ -117,7 +121,7 @@ def test_06_pointcloud_output_shape():
     env = _make_env("orange")
     uw = env.unwrapped
     result = get_raycast_pointcloud(uw.model, uw.data)
-    n = 16 * 16
+    n = 32 * 32
     assert result["points_world"].shape == (n, 3)
     assert result["points_palm"].shape == (n, 3)
     assert result["hit_distances"].shape == (n,)
@@ -126,7 +130,7 @@ def test_06_pointcloud_output_shape():
     assert result["hit_normals"].shape == (n, 3)
     assert result["ray_origins"].shape == (n, 3)
     assert result["ray_dirs_world"].shape == (n, 3)
-    assert result["grid_shape"] == (16, 16)
+    assert result["grid_shape"] == (32, 32)
     assert result["total_rays"] == n
     env.close()
 
@@ -233,7 +237,7 @@ def test_12_xml_site_present():
     assert cam_id >= 0, "pointnet_camera not found"
     palm_id = mujoco.mj_name2id(uw.model, mujoco.mjtObj.mjOBJ_BODY, "robot0:palm")
     assert uw.model.site_bodyid[site_id] == palm_id, "Site not on palm body"
-    assert uw.model.cam_fovy[cam_id] == 60.0, f"Camera fovy={uw.model.cam_fovy[cam_id]}, expected 60"
+    assert uw.model.cam_fovy[cam_id] == 40.0, f"Camera fovy={uw.model.cam_fovy[cam_id]}, expected 40"
     env.close()
 
 
@@ -294,7 +298,7 @@ def test_15_different_seeds_different_hits():
 if __name__ == "__main__":
     tests = [
         ("Raycast conditioner imports", test_01_imports),
-        ("Ray grid shape (16x16 = 256 rays)", test_02_ray_grid_shape),
+        ("Ray grid shape (32x32 = 1024 rays)", test_02_ray_grid_shape),
         ("Ray grid vectors are unit length", test_03_ray_grid_unit_vectors),
         ("Ray grid center points along -z", test_04_ray_grid_center_points_neg_z),
         ("Ray grid custom shapes", test_05_ray_grid_custom_shape),
