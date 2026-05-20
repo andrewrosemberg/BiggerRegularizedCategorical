@@ -1,9 +1,19 @@
-"""Phase 3 smoke tests: geometry-conditioning infrastructure.
+"""Smoke tests for geometry-conditioned BRC infrastructure.
+
+These tests exercise the policy-conditioning paths that are needed for
+multi-object dexterous rotation experiments.  They intentionally run small
+end-to-end checks instead of isolated unit tests only: a geometry-conditioned
+agent must be able to sample actions, update from the replay buffer, and report
+diagnostics without silently re-enabling the learned categorical task embedding.
+
+The mesh conditioner used here is a deterministic placeholder descriptor.  Its
+purpose is to verify the BRC plumbing and split-aware normalization contract; it
+is not intended to be the final learned object embedding.
 
 Run with:
     module load python/3.11.9
     source .venv/bin/activate
-    MUJOCO_GL=egl python tests/smoke_phase3.py
+    MUJOCO_GL=egl python tests/smoke_geometry_conditioning.py
 """
 
 import os
@@ -41,6 +51,7 @@ def run_test(name, fn):
 # ---------------------------------------------------------------------------
 
 def test_mesh_conditioner_imports():
+    """The mesh-conditioner API should be importable with its expected dimension."""
     from jaxrl.mesh_conditioner import (
         load_binary_stl,
         compute_mesh_features,
@@ -54,6 +65,7 @@ def test_mesh_conditioner_imports():
 
 
 def test_resolve_stl_and_load():
+    """Object XML files should resolve to readable STL meshes."""
     from jaxrl.mesh_conditioner import resolve_stl_path, load_binary_stl, compute_mesh_features
     import dex_envs
     assets_dir = os.path.join(os.path.dirname(dex_envs.__file__), "assets")
@@ -69,6 +81,7 @@ def test_resolve_stl_and_load():
 
 
 def test_build_conditioner_features():
+    """The deterministic mesh descriptor should produce normalized 8D features."""
     from jaxrl.mesh_conditioner import build_conditioner_features
     import dex_envs
     assets_dir = os.path.join(os.path.dirname(dex_envs.__file__), "assets")
@@ -83,6 +96,7 @@ def test_build_conditioner_features():
 
 
 def test_manifest_loading():
+    """The canonical ShadowHand split manifest should expose 85 train and 29 test objects."""
     from jaxrl.mesh_conditioner import load_manifest_objects
     manifest_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -96,6 +110,7 @@ def test_manifest_loading():
 
 
 def test_full_manifest_features():
+    """The full train split should produce one mesh feature row per train object."""
     from jaxrl.mesh_conditioner import load_manifest_objects, build_conditioner_features
     import dex_envs
     assets_dir = os.path.join(os.path.dirname(dex_envs.__file__), "assets")
@@ -111,10 +126,11 @@ def test_full_manifest_features():
 
 
 # ---------------------------------------------------------------------------
-# 2. BRC categorical mode (unchanged behavior)
+# 2. BRC categorical mode
 # ---------------------------------------------------------------------------
 
 def test_categorical_mode():
+    """Categorical mode should preserve learned task-embedding behavior."""
     import jax.numpy as jnp
     from jaxrl.envs import ParallelEnv
     from jaxrl.agent.brc_learner import BRC
@@ -168,6 +184,7 @@ def test_categorical_mode():
 # ---------------------------------------------------------------------------
 
 def test_none_mode():
+    """The no-conditioner ablation should train without any task embedding."""
     import jax.numpy as jnp
     from jaxrl.envs import ParallelEnv
     from jaxrl.agent.brc_learner import BRC
@@ -221,6 +238,7 @@ def test_none_mode():
 # ---------------------------------------------------------------------------
 
 def test_mesh_shape_mode():
+    """Mesh-shape mode should append external features without learned task ids."""
     import jax.numpy as jnp
     from jaxrl.envs import ParallelEnv
     from jaxrl.agent.brc_learner import BRC
@@ -283,7 +301,7 @@ def test_mesh_shape_mode():
 # ---------------------------------------------------------------------------
 
 def test_dimension_consistency():
-    """Verify actor/critic input dimensions are correct for each mode."""
+    """Actor and critic input sizes should match the selected conditioner."""
     import jax
     import jax.numpy as jnp
     from jaxrl.envs import ParallelEnv
@@ -326,7 +344,7 @@ def test_dimension_consistency():
 # ---------------------------------------------------------------------------
 
 def test_no_learned_embedding_in_mesh_mode():
-    """Verify that mesh_shape Critic has no TaskEmbedding parameters."""
+    """Mesh-shape critics must not contain learned categorical embeddings."""
     import jax
     from jaxrl.envs import ParallelEnv
     from jaxrl.agent.brc_learner import BRC
@@ -369,6 +387,7 @@ def test_no_learned_embedding_in_mesh_mode():
 # ---------------------------------------------------------------------------
 
 def test_get_infos_all_modes():
+    """Diagnostics should work after replay sampling in every conditioning mode."""
     import jax.numpy as jnp
     from jaxrl.envs import ParallelEnv
     from jaxrl.agent.brc_learner import BRC
@@ -418,7 +437,7 @@ def test_get_infos_all_modes():
 # ---------------------------------------------------------------------------
 
 def test_manifest_features_train_normalization():
-    """Verify build_conditioner_features_from_manifest uses train-split stats."""
+    """Held-out objects should be normalized with train-split mesh statistics."""
     from jaxrl.mesh_conditioner import (
         build_conditioner_features_from_manifest,
         _compute_raw_features,
@@ -461,7 +480,7 @@ def test_manifest_features_train_normalization():
 
 
 def test_manifest_features_missing_object():
-    """Verify that an object not in the manifest raises ValueError."""
+    """Objects outside the canonical manifest should fail with a clear error."""
     from jaxrl.mesh_conditioner import build_conditioner_features_from_manifest
     import dex_envs
 
@@ -486,7 +505,7 @@ def test_manifest_features_missing_object():
 # ---------------------------------------------------------------------------
 
 def test_batch_size_logic():
-    """Verify batch_size = 1024 for multi-object regardless of conditioning mode."""
+    """Multi-object runs should keep the larger batch even without task embeddings."""
     num_tasks_multi = 85
     num_tasks_single = 1
 
@@ -507,7 +526,7 @@ if __name__ == "__main__":
     run_test("3. Build conditioner features", test_build_conditioner_features)
     run_test("4. Manifest loading", test_manifest_loading)
     run_test("5. Full manifest features (85 train)", test_full_manifest_features)
-    run_test("6. BRC categorical mode (unchanged)", test_categorical_mode)
+    run_test("6. BRC categorical mode", test_categorical_mode)
     run_test("7. BRC none mode", test_none_mode)
     run_test("8. BRC mesh_shape mode", test_mesh_shape_mode)
     run_test("9. Dimension consistency", test_dimension_consistency)
