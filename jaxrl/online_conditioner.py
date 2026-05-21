@@ -24,8 +24,11 @@ the training loop, not by BRC internals.
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Any
 
+import flax.serialization
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -121,6 +124,89 @@ class OnlineRaycastConditioner:
         """
         points, masks = self.extract_raycasts(envs)
         return self.encode(points, masks)
+
+
+    def save_checkpoint(self, path: str, extra_metadata: dict | None = None):
+        """Save encoder parameters and metadata to a checkpoint directory.
+
+        Creates ``path/encoder_params.bin`` and ``path/metadata.json``.
+        """
+        os.makedirs(path, exist_ok=True)
+
+        params_path = os.path.join(path, "encoder_params.bin")
+        with open(params_path, "wb") as f:
+            f.write(flax.serialization.to_bytes(self.encoder_params))
+
+        cfg = self.raycast_config
+        meta = {
+            "encoder_type": "MaskAwarePointNet",
+            "hidden_dims": list(self.encoder_def.hidden_dims),
+            "output_dim": self.encoder_def.output_dim,
+            "embed_dim": self.embed_dim,
+            "normalize_scale": self.normalize_scale,
+            "point_channels": RAYCAST_POINT_CHANNELS,
+            "n_points": cfg.grid_h * cfg.grid_w,
+            "mask_convention": "True where ray hit geometry",
+            "coordinate_frame": "palm",
+            "raycast_config": {
+                "grid_h": cfg.grid_h,
+                "grid_w": cfg.grid_w,
+                "fovy_deg": cfg.fovy_deg,
+                "max_dist": cfg.max_dist,
+                "site_name": cfg.site_name,
+                "palm_body_name": cfg.palm_body_name,
+            },
+        }
+        if extra_metadata:
+            meta.update(extra_metadata)
+
+        meta_path = os.path.join(path, "metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+    @classmethod
+    def load_checkpoint(cls, path: str) -> "OnlineRaycastConditioner":
+        """Restore an OnlineRaycastConditioner from a saved checkpoint."""
+        meta_path = os.path.join(path, "metadata.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        hidden_dims = tuple(meta["hidden_dims"])
+        output_dim = meta["output_dim"]
+        normalize_scale = meta.get("normalize_scale", NORMALIZATION_SCALE)
+        n_points = meta["n_points"]
+
+        rc = meta.get("raycast_config", {})
+        raycast_config = RaycastConfig(
+            grid_h=rc.get("grid_h", 32),
+            grid_w=rc.get("grid_w", 32),
+            fovy_deg=rc.get("fovy_deg", 40.0),
+            max_dist=rc.get("max_dist", 0.34),
+            site_name=rc.get("site_name", "pointnet_camera_site"),
+            palm_body_name=rc.get("palm_body_name", "robot0:palm"),
+        )
+
+        encoder_def = MaskAwarePointNet(
+            hidden_dims=hidden_dims, output_dim=output_dim
+        )
+        dummy_points = jnp.zeros((1, n_points, RAYCAST_POINT_CHANNELS))
+        dummy_mask = jnp.ones((1, n_points), dtype=bool)
+        rng = jax.random.PRNGKey(0)
+        variables = encoder_def.init(rng, dummy_points, dummy_mask)
+        template_params = variables["params"]
+
+        params_path = os.path.join(path, "encoder_params.bin")
+        with open(params_path, "rb") as f:
+            encoder_params = flax.serialization.from_bytes(
+                template_params, f.read()
+            )
+
+        return cls(
+            encoder_def=encoder_def,
+            encoder_params=encoder_params,
+            raycast_config=raycast_config,
+            normalize_scale=normalize_scale,
+        )
 
 
 def build_raycast_conditioner(

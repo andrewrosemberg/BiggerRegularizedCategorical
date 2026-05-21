@@ -158,13 +158,18 @@ class ParallelEnv():
             goals.append(self._get_goal(info))
         return np.stack(states), np.stack(rewards), np.stack(terminals), np.stack(truncates), np.stack(goals)   
 
-    def evaluate(self, agent, num_episodes, temperature=0.0, render=False, max_render_steps=5000, render_frameskip=4):
+    def evaluate(self, agent, num_episodes, temperature=0.0, render=False, max_render_steps=5000, render_frameskip=4, obs_augment_fn=None):
+        raw_obs_dim = self.observation_space.shape[-1]
         n_rollouts = np.zeros(self.num_tasks)
         returns = np.zeros(self.num_tasks)
         goals = np.zeros(self.num_tasks)
         mask = np.ones(self.num_tasks)
         mask_goals = np.ones(self.num_tasks)
-        observations = self.reset()
+        raw_observations = self.reset()
+        if obs_augment_fn is not None:
+            observations = obs_augment_fn(raw_observations, self.envs)
+        else:
+            observations = raw_observations
         if render:
             renders = []
         i = 0
@@ -175,15 +180,17 @@ class ParallelEnv():
                         env_renders = self.render()
                         renders.append(env_renders)
             actions = agent.sample_actions(observations, temperature=temperature)
-            #actions = envs.action_space.sample()
-            next_observations, rewards, terms, truns, success = self.step(actions)
+            raw_observations, rewards, terms, truns, success = self.step(actions)
             returns += rewards * mask
             goals += success * mask_goals
             mask_goals = np.where(success, 0, mask_goals)
             mask_goals = np.where(np.logical_or(terms, truns), 1, mask_goals)
-            observations = next_observations
             n_rollouts += np.logical_or(terms, truns)
-            observations, terms, truns = self.reset_where_done(observations, terms, truns)
+            raw_observations, terms, truns = self.reset_where_done(raw_observations, terms, truns)
+            if obs_augment_fn is not None:
+                observations = obs_augment_fn(raw_observations, self.envs)
+            else:
+                observations = raw_observations
             mask = np.where(n_rollouts >= num_episodes, 0, 1)
             i += 1
             if n_rollouts.min() == num_episodes:

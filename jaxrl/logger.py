@@ -46,14 +46,14 @@ class EpisodeRecorder:
         print(infos_online_eval)
         return infos_online_eval
     
-    def log(self, FLAGS, agent, replay_buffer, reward_normalizer, step, eval_env=None, render=False):
+    def log(self, FLAGS, agent, replay_buffer, reward_normalizer, step, eval_env=None, render=False, obs_augment_fn=None):
         batches_info = replay_buffer.sample_task_batches()
         batches_info = reward_normalizer.normalize(batches_info, agent.get_temperature())
         infos = agent.get_infos(batches_info)
         infos_online_eval = self._get_scores()
         infos = {**infos, **infos_online_eval}
         if FLAGS.offline_evaluation:
-            eval_stats = eval_env.evaluate(agent, num_episodes=FLAGS.eval_episodes, temperature=0.0, render=render)
+            eval_stats = eval_env.evaluate(agent, num_episodes=FLAGS.eval_episodes, temperature=0.0, render=render, obs_augment_fn=obs_augment_fn)
             if render:
                 eval_stats['renders'] = get_wandb_video(eval_stats['renders'])
             infos = {**infos, **eval_stats}

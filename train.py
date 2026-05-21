@@ -136,6 +136,12 @@ def main(_):
         embeddings = online_conditioner.extract_and_encode(env.envs)
         return np.concatenate([raw_obs, embeddings], axis=-1)
 
+    def _eval_augment_obs(raw_obs, envs):
+        if online_conditioner is None:
+            return raw_obs
+        embeddings = online_conditioner.extract_and_encode(envs)
+        return np.concatenate([raw_obs, embeddings], axis=-1)
+
     observations = _augment_obs(env.reset())
 
     for i in range(1, FLAGS.max_steps + 1):
@@ -155,7 +161,7 @@ def main(_):
             batches = reward_normalizer.normalize(batches, agent.get_temperature())
             _ = agent.update(batches, FLAGS.updates_per_step, i)
             if i % eval_interval == 0 and i >= FLAGS.start_training:  
-                info_dict = statistics_recorder.log(FLAGS, agent, replay_buffer, reward_normalizer, i, eval_env, render=FLAGS.render)
+                info_dict = statistics_recorder.log(FLAGS, agent, replay_buffer, reward_normalizer, i, eval_env, render=FLAGS.render, obs_augment_fn=_eval_augment_obs if online_conditioner is not None else None)
 
             
 if __name__ == '__main__':

@@ -2,7 +2,7 @@
 
 Provides:
 
-- Deterministic 8D mesh descriptors (Phase 3 placeholder, still valid for
+- Deterministic 8D mesh descriptors (placeholder, still valid for
   ``mesh_shape`` mode until a learned PointNet replaces them).
 - ``MeshPoseConditioner``: online conditioner for ``mesh_pose`` mode.
   Combines static mesh-shape embeddings with per-step object pose
@@ -318,3 +318,80 @@ def build_mesh_pose_conditioner(
         object_names, assets_dir, manifest_path,
     )
     return MeshPoseConditioner(shape_features=features)
+
+
+# ---------------------------------------------------------------------------
+# Mesh encoder checkpoint save/load
+# ---------------------------------------------------------------------------
+
+def save_mesh_encoder_checkpoint(
+    path: str,
+    encoder_params,
+    hidden_dims: tuple[int, ...],
+    output_dim: int,
+    n_points: int,
+    point_channels: int = 3,
+    extra_metadata: dict | None = None,
+):
+    """Save a mesh PointNet encoder checkpoint."""
+    import flax.serialization
+
+    os.makedirs(path, exist_ok=True)
+
+    params_path = os.path.join(path, "encoder_params.bin")
+    with open(params_path, "wb") as f:
+        f.write(flax.serialization.to_bytes(encoder_params))
+
+    meta = {
+        "encoder_type": "MaskAwarePointNet",
+        "usage": "mesh_shape",
+        "hidden_dims": list(hidden_dims),
+        "output_dim": output_dim,
+        "n_points": n_points,
+        "point_channels": point_channels,
+        "mask_convention": "all True (mesh points always valid)",
+        "coordinate_frame": "object canonical frame, centered and scaled",
+    }
+    if extra_metadata:
+        meta.update(extra_metadata)
+
+    meta_path = os.path.join(path, "metadata.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def load_mesh_encoder_checkpoint(path: str):
+    """Load a mesh PointNet encoder from a checkpoint directory.
+
+    Returns (encoder_def, encoder_params, metadata).
+    """
+    import flax.serialization
+    import jax
+    import jax.numpy as jnp
+    from jaxrl.pointnet import MaskAwarePointNet
+
+    meta_path = os.path.join(path, "metadata.json")
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    hidden_dims = tuple(meta["hidden_dims"])
+    output_dim = meta["output_dim"]
+    n_points = meta["n_points"]
+    point_channels = meta.get("point_channels", 3)
+
+    encoder_def = MaskAwarePointNet(
+        hidden_dims=hidden_dims, output_dim=output_dim
+    )
+    dummy_points = jnp.zeros((1, n_points, point_channels))
+    dummy_mask = jnp.ones((1, n_points), dtype=bool)
+    rng = jax.random.PRNGKey(0)
+    variables = encoder_def.init(rng, dummy_points, dummy_mask)
+    template_params = variables["params"]
+
+    params_path = os.path.join(path, "encoder_params.bin")
+    with open(params_path, "rb") as f:
+        encoder_params = flax.serialization.from_bytes(
+            template_params, f.read()
+        )
+
+    return encoder_def, encoder_params, meta
