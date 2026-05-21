@@ -66,7 +66,7 @@ def _geodesic_loss(pred_rot6d: jnp.ndarray, target_rot6d: jnp.ndarray) -> jnp.nd
     R_target = jax.vmap(_to_rotmat)(target_rot6d)
     RtR = jax.vmap(lambda a, b: a.T @ b)(R_pred, R_target)
     trace = jax.vmap(jnp.trace)(RtR)
-    cos_angle = jnp.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+    cos_angle = jnp.clip((trace - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
     return jnp.mean(jnp.arccos(cos_angle))
 
 
@@ -228,7 +228,7 @@ def evaluate_split(params, model, dataset: dict) -> dict:
         Rp = to_r(pred)
         Rt = to_r(target)
         tr = jnp.trace(Rp.T @ Rt)
-        return jnp.arccos(jnp.clip((tr - 1.0) / 2.0, -1.0, 1.0))
+        return jnp.arccos(jnp.clip((tr - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7))
 
     rot_err = jax.vmap(_single_geo)(rot_pred, jnp.array(dataset["rot6d"]))
     rot_err_deg = jnp.degrees(rot_err)
@@ -283,7 +283,7 @@ def main():
         seed=args.seed,
     )
 
-    tx = optax.adam(args.lr)
+    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(args.lr))
     opt_state = tx.init(params)
 
     jit_train_step = jax.jit(
