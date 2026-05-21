@@ -3,3 +3,4 @@ protocol.md
 agent_reports/
 .venv/
 __pycache__/
+checkpoints/

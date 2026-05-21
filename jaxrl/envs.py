@@ -159,7 +159,6 @@ class ParallelEnv():
         return np.stack(states), np.stack(rewards), np.stack(terminals), np.stack(truncates), np.stack(goals)   
 
     def evaluate(self, agent, num_episodes, temperature=0.0, render=False, max_render_steps=5000, render_frameskip=4, obs_augment_fn=None):
-        raw_obs_dim = self.observation_space.shape[-1]
         n_rollouts = np.zeros(self.num_tasks)
         returns = np.zeros(self.num_tasks)
         goals = np.zeros(self.num_tasks)

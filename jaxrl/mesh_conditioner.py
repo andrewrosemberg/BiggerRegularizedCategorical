@@ -36,6 +36,7 @@ demonstrated.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import struct
@@ -75,6 +76,30 @@ def load_binary_stl(path: str):
     normals = data["normal"]
     vertices = np.concatenate([data["v1"], data["v2"], data["v3"]], axis=0)
     return vertices, normals
+
+
+def load_binary_stl_triangles(path: str):
+    """Load triangle vertex arrays and face normals from a binary STL file.
+
+    Returns
+    -------
+    v1, v2, v3 : ndarray, shape (num_triangles, 3) each
+    normals : ndarray, shape (num_triangles, 3)
+    """
+    with open(path, "rb") as f:
+        f.read(80)
+        num_triangles = struct.unpack("<I", f.read(4))[0]
+        dt = np.dtype(
+            [
+                ("normal", "<f4", (3,)),
+                ("v1", "<f4", (3,)),
+                ("v2", "<f4", (3,)),
+                ("v3", "<f4", (3,)),
+                ("attr", "<u2"),
+            ]
+        )
+        data = np.fromfile(f, dtype=dt, count=num_triangles)
+    return data["v1"], data["v2"], data["v3"], data["normal"]
 
 
 def compute_mesh_features(vertices: np.ndarray) -> np.ndarray:
@@ -198,6 +223,87 @@ def build_conditioner_features_from_manifest(
         "manifest_path": manifest_path,
     }
 
+    return features, meta
+
+
+def build_learned_mesh_features(
+    object_names: list[str],
+    assets_dir: str,
+    encoder_checkpoint_path: str,
+    seed: int = 0,
+) -> tuple[np.ndarray, dict]:
+    """Build per-object learned mesh features using a trained PointNet encoder.
+
+    Loads the mesh PointNet checkpoint, samples canonical mesh points
+    deterministically for each object, encodes them, and returns a feature
+    matrix aligned to *object_names*.
+
+    Returns
+    -------
+    features : ndarray, shape (num_objects, output_dim)
+    meta : dict with encoder metadata and object list
+    """
+    import jax.numpy as jnp
+    encoder_def, encoder_params, ckpt_meta = load_mesh_encoder_checkpoint(
+        encoder_checkpoint_path,
+    )
+    n_points = ckpt_meta["n_points"]
+
+    all_features = []
+    for obj_name in object_names:
+        obj_seed = int.from_bytes(
+            hashlib.sha256(f"{seed}:{obj_name}".encode()).digest()[:4],
+            "little",
+        )
+        rng = np.random.RandomState(obj_seed)
+
+        stl_path = resolve_stl_path(obj_name, assets_dir)
+        v1, v2, v3, _ = load_binary_stl_triangles(stl_path)
+
+        e1 = v2 - v1
+        e2 = v3 - v1
+        cross = np.cross(e1, e2)
+        areas = 0.5 * np.linalg.norm(cross, axis=-1)
+        total_area = areas.sum()
+        if total_area < 1e-12:
+            pts = v1[:min(n_points, len(v1))].copy()
+            if len(pts) < n_points:
+                idx = rng.choice(len(pts), size=n_points, replace=True)
+                pts = pts[idx]
+        else:
+            probs = areas / total_area
+            tri_idx = rng.choice(len(areas), size=n_points, replace=True, p=probs)
+            r1 = rng.uniform(size=n_points).astype(np.float32)
+            r2 = rng.uniform(size=n_points).astype(np.float32)
+            sqrt_r1 = np.sqrt(r1)
+            u = 1.0 - sqrt_r1
+            v = sqrt_r1 * (1.0 - r2)
+            w = sqrt_r1 * r2
+            pts = (u[:, None] * v1[tri_idx]
+                   + v[:, None] * v2[tri_idx]
+                   + w[:, None] * v3[tri_idx])
+        pts = pts.astype(np.float32)
+        pts -= pts.mean(axis=0, keepdims=True)
+        max_dist = np.linalg.norm(pts, axis=-1).max()
+        if max_dist > 1e-8:
+            pts /= max_dist
+
+        pts_jnp = jnp.array(pts[None])
+        mask_jnp = jnp.ones((1, n_points), dtype=bool)
+        feat = encoder_def.apply({"params": encoder_params}, pts_jnp, mask_jnp)
+        all_features.append(np.asarray(feat[0]))
+
+    features = np.stack(all_features).astype(np.float32)
+    meta = {
+        "feature_source": "learned_mesh_pointnet",
+        "encoder_checkpoint": encoder_checkpoint_path,
+        "feature_dim": int(features.shape[1]),
+        "num_objects": len(object_names),
+        "object_names": list(object_names),
+        "n_points": n_points,
+        "encoder_hidden_dims": ckpt_meta.get("hidden_dims"),
+        "encoder_output_dim": ckpt_meta.get("output_dim"),
+    }
     return features, meta
 
 

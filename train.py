@@ -34,7 +34,11 @@ flags.DEFINE_string('split_manifest', None,
                     'Path to split manifest JSON (required for mesh_shape).')
 flags.DEFINE_integer('conditioner_embed_dim', 64,
                      'Embedding dimension for online conditioners (wrist_raycast, mesh_pose).')
-        
+flags.DEFINE_string('conditioner_checkpoint', None,
+                    'Path to trained raycast conditioner checkpoint (for wrist_raycast mode).')
+flags.DEFINE_string('mesh_encoder_checkpoint', None,
+                    'Path to trained mesh PointNet encoder checkpoint (for mesh_shape / mesh_pose).')
+
 def main(_):
     if FLAGS.log_to_wandb:
         import wandb
@@ -66,36 +70,73 @@ def main(_):
     online_conditioner = None
 
     if FLAGS.conditioning_mode == 'mesh_shape':
-        if not FLAGS.split_manifest:
-            print("Error: --split_manifest is required when conditioning_mode=mesh_shape",
-                  file=sys.stderr)
-            sys.exit(1)
-        from jaxrl.mesh_conditioner import build_conditioner_features_from_manifest
         import dex_envs
         assets_dir = os.path.join(os.path.dirname(dex_envs.__file__), 'assets')
-        conditioner_features, conditioner_meta = build_conditioner_features_from_manifest(
-            env_names, assets_dir, FLAGS.split_manifest,
-        )
+        if FLAGS.mesh_encoder_checkpoint:
+            from jaxrl.mesh_conditioner import build_learned_mesh_features
+            conditioner_features, conditioner_meta = build_learned_mesh_features(
+                env_names, assets_dir, FLAGS.mesh_encoder_checkpoint, seed=FLAGS.seed,
+            )
+            print(f"Loaded mesh encoder from {FLAGS.mesh_encoder_checkpoint} "
+                  f"(feature_dim={conditioner_features.shape[1]})")
+        else:
+            if not FLAGS.split_manifest:
+                print("Error: --split_manifest is required when conditioning_mode=mesh_shape "
+                      "and no --mesh_encoder_checkpoint is provided",
+                      file=sys.stderr)
+                sys.exit(1)
+            from jaxrl.mesh_conditioner import build_conditioner_features_from_manifest
+            conditioner_features, conditioner_meta = build_conditioner_features_from_manifest(
+                env_names, assets_dir, FLAGS.split_manifest,
+            )
+            print("WARNING: mesh_shape uses deterministic 8D descriptors (no learned encoder). "
+                  "Use --mesh_encoder_checkpoint to load a trained PointNet.",
+                  file=sys.stderr)
         kwargs['conditioner_features'] = conditioner_features
 
     elif FLAGS.conditioning_mode == 'wrist_raycast':
-        from jaxrl.online_conditioner import build_raycast_conditioner
-        online_conditioner = build_raycast_conditioner(
-            seed=FLAGS.seed, output_dim=FLAGS.conditioner_embed_dim,
-        )
+        if FLAGS.conditioner_checkpoint:
+            from jaxrl.online_conditioner import OnlineRaycastConditioner
+            online_conditioner = OnlineRaycastConditioner.load_checkpoint(
+                FLAGS.conditioner_checkpoint,
+            )
+            print(f"Loaded raycast conditioner from {FLAGS.conditioner_checkpoint} "
+                  f"(embed_dim={online_conditioner.embed_dim})")
+        else:
+            from jaxrl.online_conditioner import build_raycast_conditioner
+            online_conditioner = build_raycast_conditioner(
+                seed=FLAGS.seed, output_dim=FLAGS.conditioner_embed_dim,
+            )
+            print("WARNING: wrist_raycast conditioner is UNTRAINED (random parameters). "
+                  "Use --conditioner_checkpoint to load a trained encoder.",
+                  file=sys.stderr)
 
     elif FLAGS.conditioning_mode == 'mesh_pose':
-        from jaxrl.mesh_conditioner import build_mesh_pose_conditioner
         import dex_envs
+        from jaxrl.mesh_conditioner import MeshPoseConditioner
         assets_dir = os.path.join(os.path.dirname(dex_envs.__file__), 'assets')
-        if not FLAGS.split_manifest:
-            print("Error: --split_manifest is required when conditioning_mode=mesh_pose",
+        if FLAGS.mesh_encoder_checkpoint:
+            from jaxrl.mesh_conditioner import build_learned_mesh_features
+            shape_features, mesh_meta = build_learned_mesh_features(
+                env_names, assets_dir, FLAGS.mesh_encoder_checkpoint, seed=FLAGS.seed,
+            )
+            online_conditioner = MeshPoseConditioner(shape_features=shape_features)
+            print(f"Loaded mesh encoder from {FLAGS.mesh_encoder_checkpoint} "
+                  f"(shape_dim={shape_features.shape[1]}, total_embed_dim={online_conditioner.embed_dim})")
+        else:
+            if not FLAGS.split_manifest:
+                print("Error: --split_manifest is required when conditioning_mode=mesh_pose "
+                      "and no --mesh_encoder_checkpoint is provided",
+                      file=sys.stderr)
+                sys.exit(1)
+            from jaxrl.mesh_conditioner import build_mesh_pose_conditioner
+            online_conditioner = build_mesh_pose_conditioner(
+                env_names, assets_dir, FLAGS.split_manifest,
+                seed=FLAGS.seed, embed_dim=FLAGS.conditioner_embed_dim,
+            )
+            print("WARNING: mesh_pose uses deterministic 8D shape descriptors (no learned encoder). "
+                  "Use --mesh_encoder_checkpoint to load a trained PointNet.",
                   file=sys.stderr)
-            sys.exit(1)
-        online_conditioner = build_mesh_pose_conditioner(
-            env_names, assets_dir, FLAGS.split_manifest,
-            seed=FLAGS.seed, embed_dim=FLAGS.conditioner_embed_dim,
-        )
 
     obs_sample = env.observation_space.sample()[:1]
     if online_conditioner is not None:

@@ -350,7 +350,7 @@ def test_mesh_training_script_imports():
     finally:
         sys.modules.pop(name, None)
     assert hasattr(mod, "build_mesh_dataset")
-    assert hasattr(mod, "sample_mesh_points")
+    assert hasattr(mod, "sample_mesh_surface_points")
     assert hasattr(mod, "train_step")
     assert hasattr(mod, "evaluate_embeddings")
 

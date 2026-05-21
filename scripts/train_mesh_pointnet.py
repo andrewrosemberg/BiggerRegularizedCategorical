@@ -45,6 +45,7 @@ from jaxrl.mesh_conditioner import (
     load_manifest_objects,
     resolve_stl_path,
     load_binary_stl,
+    load_binary_stl_triangles,
     compute_mesh_features,
     save_mesh_encoder_checkpoint,
     load_mesh_encoder_checkpoint,
@@ -53,25 +54,43 @@ from jaxrl.mesh_conditioner import (
 from jaxrl.pointnet import MaskAwarePointNet
 
 
-def sample_mesh_points(
-    vertices: np.ndarray,
-    normals: np.ndarray,
+def sample_mesh_surface_points(
+    v1: np.ndarray,
+    v2: np.ndarray,
+    v3: np.ndarray,
     n_points: int,
     rng: np.random.RandomState,
     center: bool = True,
     scale: bool = True,
 ) -> np.ndarray:
-    """Sample points from mesh surface with uniform area weighting.
+    """Sample points from mesh surface with triangle-area weighting.
 
-    For simplicity, samples vertices uniformly (not area-weighted).
-    Centers and scales to unit sphere by default.
+    Each triangle is sampled with probability proportional to its area.
+    Points are placed uniformly within the selected triangle using
+    barycentric coordinates.
     """
-    n_verts = vertices.shape[0]
-    if n_verts >= n_points:
-        idx = rng.choice(n_verts, size=n_points, replace=False)
+    e1 = v2 - v1
+    e2 = v3 - v1
+    cross = np.cross(e1, e2)
+    areas = 0.5 * np.linalg.norm(cross, axis=-1)
+    total_area = areas.sum()
+    if total_area < 1e-12:
+        pts = v1[:min(n_points, len(v1))].copy()
+        if len(pts) < n_points:
+            idx = rng.choice(len(pts), size=n_points, replace=True)
+            pts = pts[idx]
     else:
-        idx = rng.choice(n_verts, size=n_points, replace=True)
-    pts = vertices[idx].copy()
+        probs = areas / total_area
+        tri_idx = rng.choice(len(areas), size=n_points, replace=True, p=probs)
+        r1 = rng.uniform(size=n_points).astype(np.float32)
+        r2 = rng.uniform(size=n_points).astype(np.float32)
+        sqrt_r1 = np.sqrt(r1)
+        u = 1.0 - sqrt_r1
+        v = sqrt_r1 * (1.0 - r2)
+        w = sqrt_r1 * r2
+        pts = (u[:, None] * v1[tri_idx]
+               + v[:, None] * v2[tri_idx]
+               + w[:, None] * v3[tri_idx])
 
     if center:
         pts -= pts.mean(axis=0, keepdims=True)
@@ -102,9 +121,10 @@ def build_mesh_dataset(
         stl_path = resolve_stl_path(obj_name, assets_dir)
         vertices, normals = load_binary_stl(stl_path)
         desc = compute_mesh_features(vertices)
+        v1, v2, v3, _ = load_binary_stl_triangles(stl_path)
 
         for _ in range(augmentations_per_object):
-            pts = sample_mesh_points(vertices, normals, n_points, rng)
+            pts = sample_mesh_surface_points(v1, v2, v3, n_points, rng)
             all_points.append(pts)
             all_obj_ids.append(obj_idx)
             all_descriptors.append(desc)
