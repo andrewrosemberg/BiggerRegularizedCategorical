@@ -203,7 +203,9 @@ def main(_):
             _ = agent.update(batches, FLAGS.updates_per_step, i)
             if i % eval_interval == 0 and i >= FLAGS.start_training:  
                 info_dict = statistics_recorder.log(FLAGS, agent, replay_buffer, reward_normalizer, i, eval_env, render=FLAGS.render, obs_augment_fn=_eval_augment_obs if online_conditioner is not None else None)
+                eval_summary = {k: info_dict[k] for k in ('goal', 'return', 'goal_online', 'return_online') if k in info_dict}
+                print(f"step={i} {eval_summary}")
 
-            
+
 if __name__ == '__main__':
     app.run(main)

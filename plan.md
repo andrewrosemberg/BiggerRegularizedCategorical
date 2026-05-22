@@ -665,10 +665,10 @@ shape is enough. Mesh-pose is an upper bound for geometry plus state.
 First run an 8-object pilot before full 85-object training. The pilot should
 compare:
 
-- [ ] `none`;
-- [ ] `wrist_raycast`;
-- [ ] `mesh_shape`;
-- [ ] `mesh_pose`.
+- [x] `none`;
+- [x] `wrist_raycast`;
+- [x] `mesh_shape`;
+- [x] `mesh_pose`.
 
 Pilot object set:
 
@@ -685,8 +685,27 @@ Pilot settings:
 - `offline_evaluation=true`;
 - `render=false`.
 
-If the pilot is stable and runtime is feasible, run the full 85-object
-comparison:
+The 8-object pilot is a stability check, not a full-runtime estimate. It
+completed successfully, but full training must not be launched from the 8-object
+wall-clock numbers alone. `ParallelEnv` steps environments sequentially, so the
+rough wall-clock scale from an 8-object, 50k-step pilot to an 85-object,
+1M-step run is
+
+$$
+\frac{85}{8}\cdot\frac{1{,}000{,}000}{50{,}000}\approx 212.5.
+$$
+
+Before full policy training, run an 85-object feasibility benchmark on the
+train split:
+
+- [ ] measure training throughput for `categorical`, `none`, `wrist_raycast`,
+  `mesh_shape`, and `mesh_pose`;
+- [ ] measure or estimate offline evaluation overhead with `eval_episodes=10`;
+- [ ] report projected wall-clock for each 1M-step full run;
+- [ ] decide whether full `wrist_raycast` training is feasible as implemented or
+  requires a runtime change before launch.
+
+If the 85-object benchmark confirms feasible runtime, run the full comparison:
 
 | Run family | Train objects | Held-out evaluation | Conditioner | Interpretation |
 |---|---:|---:|---|---|
