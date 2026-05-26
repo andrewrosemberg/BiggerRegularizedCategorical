@@ -698,14 +698,29 @@ $$
 Before full policy training, run an 85-object feasibility benchmark on the
 train split:
 
-- [ ] measure training throughput for `categorical`, `none`, `wrist_raycast`,
+- [x] measure training throughput for `categorical`, `none`, `wrist_raycast`,
   `mesh_shape`, and `mesh_pose`;
-- [ ] measure or estimate offline evaluation overhead with `eval_episodes=10`;
-- [ ] report projected wall-clock for each 1M-step full run;
-- [ ] decide whether full `wrist_raycast` training is feasible as implemented or
+- [x] measure or estimate offline evaluation overhead with `eval_episodes=10`;
+- [x] report projected wall-clock for each 1M-step full run;
+- [x] decide whether full `wrist_raycast` training is feasible as implemented or
   requires a runtime change before launch.
 
-If the 85-object benchmark confirms feasible runtime, run the full comparison:
+The 85-object benchmark completed without crashes, NaNs, or memory issues. The
+projected wall-clock for 1M steps plus evaluation is approximately:
+
+| Mode | Projected runtime | Decision |
+|---|---:|---|
+| `categorical` | 4.5 days | feasible |
+| `none` | 4.3 days | feasible |
+| `mesh_shape` | 3.6 days | feasible |
+| `mesh_pose` | 3.1 days | feasible |
+| `wrist_raycast` | 20.7 days | mitigate before full launch |
+
+The non-raycast full runs can proceed with ordinary long SLURM allocations.
+The `wrist_raycast` run should not be launched for 1M steps until long-run
+checkpoint/resume is available or a runtime mitigation is chosen.
+
+Full comparison to run:
 
 | Run family | Train objects | Held-out evaluation | Conditioner | Interpretation |
 |---|---:|---:|---|---|
@@ -727,6 +742,14 @@ Default full-run settings:
 
 Any hyperparameter change should be shared across comparable modes unless the run
 is explicitly labeled as tuning.
+
+Before launching the full `wrist_raycast` run, choose and implement at least one
+of:
+
+- checkpoint/resume support for policy training across multiple SLURM jobs;
+- a reduced or lower-frequency raycast configuration, followed by a matching
+  encoder compatibility check;
+- a shorter shared step budget for the first full comparison.
 
 ### Phase 8: Single-Object BRC Policy Training
 
