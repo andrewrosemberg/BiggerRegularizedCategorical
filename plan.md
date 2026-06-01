@@ -101,6 +101,13 @@ Only `categorical` may use a learned task embedding. In all other modes,
 actor and critic inputs must receive either no conditioner or a geometry-derived
 conditioner.
 
+Implementation note: the original BRC code uses a flag named `multitask` to
+decide whether `build_actor_input()` appends a learned categorical task
+embedding. In this project, `multitask=True` means "use the categorical
+embedding path", not merely "there are multiple objects". Geometry modes set
+that flag to `False`; their conditioning vectors are already concatenated into
+the observation before the actor and critic update functions run.
+
 ## 4. Shared PointNet Block
 
 This section defines the reusable PointNet block $\operatorname{PN}_\eta$ used

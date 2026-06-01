@@ -169,6 +169,10 @@ class BRC(object):
 
         task_ids_init = self.task_ids[:1]
 
+        # Historical naming: self.multitask controls only the original learned
+        # categorical task embedding. Geometry-conditioned runs can still have
+        # many tasks, but they must keep this False so update.py does not append
+        # categorical embeddings.
         if conditioning_mode == "categorical":
             self.multitask = True if num_tasks > 1 else False
             self.conditioner_features = None
