@@ -2,6 +2,7 @@ memory.md
 protocol.md
 agent_reports/
 .venv/
+.venv_mjlab_check/
 __pycache__/
 checkpoints/
 .claude/
