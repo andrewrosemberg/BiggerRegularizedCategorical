@@ -408,10 +408,6 @@ def build_shadowhand_cube_env_cfg(
 
     terminations = {
         "time_out": TerminationTermCfg(func=envs_mdp.time_out, time_out=True),
-        "cube_fell": TerminationTermCfg(
-            func=envs_mdp.root_height_below_minimum,
-            params={"minimum_height": 0.05, "asset_cfg": SceneEntityCfg("cube")},
-        ),
     }
 
     rewards = {

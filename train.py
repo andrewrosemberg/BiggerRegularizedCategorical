@@ -43,7 +43,14 @@ flags.DEFINE_string('env_backend', 'gymnasium',
 flags.DEFINE_integer('mjlab_num_envs', 64,
                      'Number of parallel environments for mjlab backend.')
 
+_VALID_BACKENDS = {'gymnasium', 'mjlab'}
+
 def main(_):
+    if FLAGS.env_backend not in _VALID_BACKENDS:
+        print(f"Error: --env_backend must be one of {sorted(_VALID_BACKENDS)}; got '{FLAGS.env_backend}'",
+              file=sys.stderr)
+        sys.exit(1)
+
     if FLAGS.log_to_wandb:
         import wandb
         wandb.init(
