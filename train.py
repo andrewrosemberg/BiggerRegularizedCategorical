@@ -38,6 +38,10 @@ flags.DEFINE_string('conditioner_checkpoint', None,
                     'Path to trained raycast conditioner checkpoint (for wrist_raycast mode).')
 flags.DEFINE_string('mesh_encoder_checkpoint', None,
                     'Path to trained mesh PointNet encoder checkpoint (for mesh_shape / mesh_pose).')
+flags.DEFINE_string('env_backend', 'gymnasium',
+                    'Environment backend: gymnasium | mjlab.')
+flags.DEFINE_integer('mjlab_num_envs', 64,
+                     'Number of parallel environments for mjlab backend.')
 
 def main(_):
     if FLAGS.log_to_wandb:
@@ -51,11 +55,30 @@ def main(_):
         )
         
     env_names = get_environment_list(FLAGS.env_names)
-    env = ParallelEnv(env_names, seed=FLAGS.seed)
-    if FLAGS.offline_evaluation:
-        eval_env = ParallelEnv(env_names, seed=FLAGS.seed+42)
-    else:
+
+    if FLAGS.env_backend == 'mjlab':
+        unsupported = [n for n in env_names if n != 'cube']
+        if unsupported:
+            print(f"Error: mjlab backend only supports cube; got {unsupported}", file=sys.stderr)
+            sys.exit(1)
+        if FLAGS.conditioning_mode != 'none':
+            print(f"Error: mjlab backend requires --conditioning_mode=none; got {FLAGS.conditioning_mode}", file=sys.stderr)
+            sys.exit(1)
+        if FLAGS.offline_evaluation:
+            print("Warning: mjlab backend does not support offline evaluation; forcing --offline_evaluation=False", file=sys.stderr)
+            FLAGS.offline_evaluation = False
+        if FLAGS.render:
+            print("Warning: mjlab backend does not support render; forcing --render=False", file=sys.stderr)
+            FLAGS.render = False
+        from jaxrl.mjlab_envs import MjlabParallelEnv
+        env = MjlabParallelEnv(env_names, seed=FLAGS.seed, num_envs=FLAGS.mjlab_num_envs)
         eval_env = None
+    else:
+        env = ParallelEnv(env_names, seed=FLAGS.seed)
+        if FLAGS.offline_evaluation:
+            eval_env = ParallelEnv(env_names, seed=FLAGS.seed+42)
+        else:
+            eval_env = None
         
     eval_interval = FLAGS.eval_interval if FLAGS.offline_evaluation else 5000
         

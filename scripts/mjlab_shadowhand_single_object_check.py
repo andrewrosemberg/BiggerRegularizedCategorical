@@ -47,11 +47,52 @@ assert CUBE_XML.exists(), f"Missing XML: {CUBE_XML}"
 
 
 # ---------------------------------------------------------------------------
+# Gymnasium actuator data (extracted from compiled manipulate_cube.xml)
+#
+# Mapping: policy action in [-1, 1] -> ctrl = center + action * half_width
+# where center = (ctrl_hi + ctrl_lo) / 2, half_width = (ctrl_hi - ctrl_lo) / 2
+# relative_control=False
+# ---------------------------------------------------------------------------
+
+GYM_ACTUATOR_ORDER = (
+    ("robot0:A_WRJ1", "robot0:WRJ1", -0.489,  0.14 ),
+    ("robot0:A_WRJ0", "robot0:WRJ0", -0.698,  0.489),
+    ("robot0:A_FFJ3", "robot0:FFJ3", -0.349,  0.349),
+    ("robot0:A_FFJ2", "robot0:FFJ2",  0.0,    1.571),
+    ("robot0:A_FFJ1", "robot0:FFJ1",  0.0,    1.571),
+    ("robot0:A_MFJ3", "robot0:MFJ3", -0.349,  0.349),
+    ("robot0:A_MFJ2", "robot0:MFJ2",  0.0,    1.571),
+    ("robot0:A_MFJ1", "robot0:MFJ1",  0.0,    1.571),
+    ("robot0:A_RFJ3", "robot0:RFJ3", -0.349,  0.349),
+    ("robot0:A_RFJ2", "robot0:RFJ2",  0.0,    1.571),
+    ("robot0:A_RFJ1", "robot0:RFJ1",  0.0,    1.571),
+    ("robot0:A_LFJ4", "robot0:LFJ4",  0.0,    0.785),
+    ("robot0:A_LFJ3", "robot0:LFJ3", -0.349,  0.349),
+    ("robot0:A_LFJ2", "robot0:LFJ2",  0.0,    1.571),
+    ("robot0:A_LFJ1", "robot0:LFJ1",  0.0,    1.571),
+    ("robot0:A_THJ4", "robot0:THJ4", -1.047,   1.047),
+    ("robot0:A_THJ3", "robot0:THJ3",  0.0,    1.222),
+    ("robot0:A_THJ2", "robot0:THJ2", -0.209,  0.209),
+    ("robot0:A_THJ1", "robot0:THJ1", -0.524,  0.524),
+    ("robot0:A_THJ0", "robot0:THJ0", -1.571,  0.0  ),
+)
+
+GYM_JOINT_ORDER = tuple(row[1] for row in GYM_ACTUATOR_ORDER)
+GYM_CTRL_LO    = np.array([row[2] for row in GYM_ACTUATOR_ORDER])
+GYM_CTRL_HI    = np.array([row[3] for row in GYM_ACTUATOR_ORDER])
+GYM_CTRL_CENTER    = (GYM_CTRL_HI + GYM_CTRL_LO) / 2.0
+GYM_CTRL_HALFWIDTH = (GYM_CTRL_HI - GYM_CTRL_LO) / 2.0
+
+GYM_CUBE_MASS = 0.15575129663498727
+GYM_CUBE_DENSITY = 567
+GYM_OBJ_FREEJOINT_DAMPING = 0.01
+
+
+# ---------------------------------------------------------------------------
 # Spec functions: ShadowHand robot + cube object
 # ---------------------------------------------------------------------------
 
 def _embed_assets(spec: mujoco.MjSpec) -> None:
-    """Embed mesh and texture files into spec.assets for GPU/distributed use."""
     assets = {}
     meshdir = Path(spec.modelfiledir) / spec.meshdir if spec.meshdir else Path(spec.modelfiledir)
     texdir = Path(spec.modelfiledir) / spec.texturedir if spec.texturedir else Path(spec.modelfiledir)
@@ -68,12 +109,6 @@ def _embed_assets(spec: mujoco.MjSpec) -> None:
 
 
 def _zero_geom_margins(spec: mujoco.MjSpec) -> None:
-    """Set all geom margins to 0 for MuJoCo Warp compatibility.
-
-    MuJoCo Warp (MULTICCD) does not support non-zero geom margins.
-    The ShadowHand XML sets margin=0.0005 in default classes and on
-    specific geoms.
-    """
     spec.default.geom.margin = 0.0
     for class_name in [
         "robot0:asset_class", "robot0:D_Touch", "robot0:DC_Hand",
@@ -82,7 +117,6 @@ def _zero_geom_margins(spec: mujoco.MjSpec) -> None:
         dc = spec.find_default(class_name)
         if dc:
             dc.geom.margin = 0.0
-
     model = spec.compile()
     for i in range(model.ngeom):
         if model.geom_margin[i] != 0.0:
@@ -93,26 +127,15 @@ def _zero_geom_margins(spec: mujoco.MjSpec) -> None:
                     g.margin = 0.0
 
 
-SHADOWHAND_ACTUATED_JOINTS = (
-    "robot0:WRJ1", "robot0:WRJ0",
-    "robot0:FFJ3", "robot0:FFJ2", "robot0:FFJ1",
-    "robot0:MFJ3", "robot0:MFJ2", "robot0:MFJ1",
-    "robot0:RFJ3", "robot0:RFJ2", "robot0:RFJ1",
-    "robot0:LFJ4", "robot0:LFJ3", "robot0:LFJ2", "robot0:LFJ1",
-    "robot0:THJ4", "robot0:THJ3", "robot0:THJ2", "robot0:THJ1", "robot0:THJ0",
-)
+SHADOWHAND_ACTUATED_JOINTS = GYM_JOINT_ORDER
 
 SHADOWHAND_WRIST_JOINTS = ("robot0:WRJ1", "robot0:WRJ0")
-SHADOWHAND_FINGER_JOINTS = tuple(j for j in SHADOWHAND_ACTUATED_JOINTS if j not in SHADOWHAND_WRIST_JOINTS)
+SHADOWHAND_FINGER_JOINTS = tuple(
+    j for j in SHADOWHAND_ACTUATED_JOINTS if j not in SHADOWHAND_WRIST_JOINTS
+)
 
 
 def get_shadowhand_spec() -> mujoco.MjSpec:
-    """Load the ShadowHand robot from the existing manipulate_cube.xml.
-
-    Removes the object, target, and floor bodies so that only the hand
-    remains. Also removes MuJoCo general actuators — mjlab will add
-    IdealPd actuators via EntityArticulationInfoCfg.
-    """
     spec = mujoco.MjSpec.from_file(str(CUBE_XML))
     for body in list(spec.worldbody.bodies):
         if body.name in ("target", "object", "floor0"):
@@ -125,24 +148,18 @@ def get_shadowhand_spec() -> mujoco.MjSpec:
 
 
 def _make_shadowhand_articulation() -> EntityArticulationInfoCfg:
-    """Create mjlab actuator config matching the ShadowHand position control.
-
-    The ShadowHand XML uses general actuators with:
-      wrist (WRJ): stiffness=5.0, damping=0, effort_limit~4.79
-      finger: stiffness=1.0, damping=0, effort_limit~0.72-2.37
-    """
     return EntityArticulationInfoCfg(
         actuators=(
             IdealPdActuatorCfg(
                 target_names_expr=SHADOWHAND_WRIST_JOINTS,
                 stiffness=5.0,
-                damping=0.3,
+                damping=0.0,
                 effort_limit=5.0,
             ),
             IdealPdActuatorCfg(
                 target_names_expr=SHADOWHAND_FINGER_JOINTS,
                 stiffness=1.0,
-                damping=0.1,
+                damping=0.0,
                 effort_limit=1.0,
             ),
         ),
@@ -150,20 +167,19 @@ def _make_shadowhand_articulation() -> EntityArticulationInfoCfg:
 
 
 def get_cube_spec() -> mujoco.MjSpec:
-    """Create a free-body cube with the same mesh used by manipulate_cube.xml."""
-    cube_stl = ASSETS_DIR / ".." / "stls" / "hand" / "contactdb_objects" / "cube.stl"
-    cube_stl = cube_stl.resolve()
+    cube_stl = (ASSETS_DIR / ".." / "stls" / "hand" / "contactdb_objects" / "cube.stl").resolve()
     assert cube_stl.exists(), f"Missing mesh: {cube_stl}"
 
     spec = mujoco.MjSpec()
     spec.add_mesh(name="cube_mesh", file=str(cube_stl))
     body = spec.worldbody.add_body(name="cube")
-    body.add_freejoint(name="cube_joint")
+    fj = body.add_freejoint(name="cube_joint")
+    fj.damping = np.full(3, GYM_OBJ_FREEJOINT_DAMPING)
     body.add_geom(
         name="cube_geom",
         type=mujoco.mjtGeom.mjGEOM_MESH,
         meshname="cube_mesh",
-        mass=0.1,
+        density=GYM_CUBE_DENSITY,
         condim=4,
         rgba=(0.8, 0.2, 0.2, 1.0),
     )
@@ -172,93 +188,8 @@ def get_cube_spec() -> mujoco.MjSpec:
 
 
 # ---------------------------------------------------------------------------
-# Custom observation terms
+# Quaternion helpers (w, x, y, z convention — matches MuJoCo and mjlab)
 # ---------------------------------------------------------------------------
-
-def object_root_pos(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Object world-frame position [num_envs, 3]."""
-    return env.scene[asset_cfg.name].data.root_link_pos_w
-
-
-def object_root_quat(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Object world-frame quaternion (w,x,y,z) [num_envs, 4]."""
-    return env.scene[asset_cfg.name].data.root_link_quat_w
-
-
-def object_root_lin_vel(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Object world-frame linear velocity [num_envs, 3]."""
-    return env.scene[asset_cfg.name].data.root_link_lin_vel_w
-
-
-def object_root_ang_vel(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Object world-frame angular velocity [num_envs, 3]."""
-    return env.scene[asset_cfg.name].data.root_link_ang_vel_w
-
-
-class desired_goal_obs:
-    """Maintain and return a random target rotation as the desired goal.
-
-    Matches Gymnasium ManipulateEnv with target_rotation='z',
-    target_position='ignore'. Returns [pos(3), quat(4)] = 7 dims.
-
-    Stores the target on the env object so that other terms (reward,
-    metrics) can access it without going through the observation manager.
-    """
-
-    def __init__(self, cfg, env: ManagerBasedRlEnv):
-        self._env = env
-        n = env.num_envs
-        self._target = torch.zeros((n, 7), device=env.device)
-        env._desired_goal_target = self._target
-        self.reset(None)
-
-    def reset(self, env_ids):
-        if env_ids is None:
-            env_ids = torch.arange(self._env.num_envs, device=self._env.device)
-        n = len(env_ids)
-        cube = self._env.scene["cube"]
-        obj_pos = cube.data.root_link_pos_w[env_ids]
-        angles = torch.rand(n, device=self._env.device) * 2 * torch.pi - torch.pi
-        zeros = torch.zeros(n, device=self._env.device)
-        qw = torch.cos(angles / 2)
-        qx = zeros
-        qy = zeros
-        qz = torch.sin(angles / 2)
-        target_quat = torch.stack([qw, qx, qy, qz], dim=-1)
-        target_quat = target_quat / target_quat.norm(dim=-1, keepdim=True)
-        self._target[env_ids] = torch.cat([obj_pos, target_quat], dim=-1)
-
-    def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
-        return self._target
-
-
-# ---------------------------------------------------------------------------
-# Custom reward term: sparse reward matching Gymnasium
-# ---------------------------------------------------------------------------
-
-class sparse_rotation_reward:
-    """Sparse reward: 0 if rotation distance < threshold, -1 otherwise.
-
-    Matches Gymnasium ManipulateEnv with reward_type='sparse',
-    target_rotation='z', target_position='ignore'.
-    """
-
-    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
-        self._env = env
-
-    def reset(self, env_ids):
-        pass
-
-    def __call__(self, env: ManagerBasedRlEnv, rotation_threshold: float = 0.1) -> torch.Tensor:
-        target = env._desired_goal_target
-        cube = env.scene["cube"]
-        obj_quat = cube.data.root_link_quat_w
-        target_quat = target[:, 3:]
-        quat_diff = _quat_mul(obj_quat, _quat_conjugate(target_quat))
-        angle_diff = 2.0 * torch.acos(torch.clamp(quat_diff[:, 0].abs(), 0.0, 1.0))
-        success = (angle_diff < rotation_threshold).float()
-        return success - 1.0
-
 
 def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     w1, x1, y1, z1 = q1.unbind(-1)
@@ -275,16 +206,125 @@ def _quat_conjugate(q: torch.Tensor) -> torch.Tensor:
     return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
 
 
+def compute_rotation_distance(q_achieved: torch.Tensor, q_desired: torch.Tensor) -> torch.Tensor:
+    """Gymnasium Robotics rotation distance in radians.
+
+    This follows the installed ShadowHand formula exactly: the scalar part of
+    the quaternion difference is clipped to [-1, 1] without applying abs().
+    """
+    quat_diff = _quat_mul(q_achieved, _quat_conjugate(q_desired))
+    return 2.0 * torch.acos(torch.clamp(quat_diff[..., 0], -1.0, 1.0))
+
+
+def compute_is_success(
+    q_achieved: torch.Tensor,
+    q_desired: torch.Tensor,
+    rotation_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Per-env success flag matching Gymnasium ManipulateEnv._is_success.
+
+    target_position='ignore' -> position distance not checked.
+    target_rotation='z' -> full quaternion distance < rotation_threshold.
+    """
+    return (compute_rotation_distance(q_achieved, q_desired) < rotation_threshold).float()
+
+
+def compute_sparse_reward(
+    q_achieved: torch.Tensor,
+    q_desired: torch.Tensor,
+    rotation_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Sparse reward matching Gymnasium: success - 1 => {0, -1}."""
+    return compute_is_success(q_achieved, q_desired, rotation_threshold) - 1.0
+
+
+# ---------------------------------------------------------------------------
+# Custom observation terms
+# ---------------------------------------------------------------------------
+
+def object_root_pos(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    return env.scene[asset_cfg.name].data.root_link_pos_w
+
+
+def object_root_quat(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    return env.scene[asset_cfg.name].data.root_link_quat_w
+
+
+def object_root_lin_vel(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    return env.scene[asset_cfg.name].data.root_link_lin_vel_w
+
+
+def object_root_ang_vel(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    return env.scene[asset_cfg.name].data.root_link_ang_vel_w
+
+
+class desired_goal_obs:
+    """Random z-axis target rotation, re-sampled on reset.
+
+    Matches Gymnasium ManipulateEnv with target_rotation='z',
+    target_position='ignore'. Returns [pos(3), quat(4)] = 7 dims.
+    Stores the target on env._desired_goal_target for reward/success access.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        self._env = env
+        self._target = torch.zeros((env.num_envs, 7), device=env.device)
+        env._desired_goal_target = self._target
+        self.reset(None)
+
+    def reset(self, env_ids):
+        if env_ids is None:
+            env_ids = torch.arange(self._env.num_envs, device=self._env.device)
+        n = len(env_ids)
+        cube = self._env.scene["cube"]
+        obj_pos = cube.data.root_link_pos_w[env_ids]
+        angles = torch.rand(n, device=self._env.device) * 2 * torch.pi - torch.pi
+        zeros = torch.zeros(n, device=self._env.device)
+        qw = torch.cos(angles / 2)
+        target_quat = torch.stack([qw, zeros, zeros, torch.sin(angles / 2)], dim=-1)
+        target_quat = target_quat / target_quat.norm(dim=-1, keepdim=True)
+        self._target[env_ids] = torch.cat([obj_pos, target_quat], dim=-1)
+
+    def __call__(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+        return self._target
+
+
+# ---------------------------------------------------------------------------
+# Custom reward term
+# ---------------------------------------------------------------------------
+
+class sparse_rotation_reward:
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+        self._env = env
+
+    def reset(self, env_ids):
+        pass
+
+    def __call__(self, env: ManagerBasedRlEnv, rotation_threshold: float = 0.1) -> torch.Tensor:
+        target = env._desired_goal_target
+        obj_quat = env.scene["cube"].data.root_link_quat_w
+        return compute_sparse_reward(obj_quat, target[:, 3:], rotation_threshold)
+
+
 # ---------------------------------------------------------------------------
 # Build mjlab env config
 # ---------------------------------------------------------------------------
 
+def _action_scale_offset() -> tuple[dict[str, float], dict[str, float]]:
+    """Per-joint scale and offset matching Gymnasium's ctrlrange mapping."""
+    scale = {}
+    offset = {}
+    for _, joint, ctrl_lo, ctrl_hi in GYM_ACTUATOR_ORDER:
+        scale[joint] = (ctrl_hi - ctrl_lo) / 2.0
+        offset[joint] = (ctrl_hi + ctrl_lo) / 2.0
+    return scale, offset
+
+
 def build_shadowhand_cube_env_cfg(
     *, num_envs: int = 4, auto_reset: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-    """Build a mjlab env config matching Gymnasium cube-rotate-v1 semantics."""
-
     cube_pos = (1.0, 0.87, 0.2)
+    act_scale, act_offset = _action_scale_offset()
 
     observations = {
         "policy": ObservationGroupCfg(
@@ -325,8 +365,9 @@ def build_shadowhand_cube_env_cfg(
         "joint_pos": envs_mdp.JointPositionActionCfg(
             entity_name="robot",
             actuator_names=(".*",),
-            scale=1.0,
-            offset=0.0,
+            scale=act_scale,
+            offset=act_offset,
+            use_default_offset=False,
         ),
     }
 
@@ -358,6 +399,7 @@ def build_shadowhand_cube_env_cfg(
                     "x": (-0.01, 0.01),
                     "y": (-0.01, 0.01),
                     "z": (-0.005, 0.005),
+                    "yaw": (-3.14159, 3.14159),
                 },
                 "velocity_range": {},
             },
@@ -385,9 +427,7 @@ def build_shadowhand_cube_env_cfg(
             terrain=TerrainEntityCfg(terrain_type="plane"),
             entities={
                 "robot": EntityCfg(
-                    init_state=EntityCfg.InitialStateCfg(
-                        pos=(0.0, 0.0, 0.0),
-                    ),
+                    init_state=EntityCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
                     spec_fn=get_shadowhand_spec,
                     articulation=_make_shadowhand_articulation(),
                 ),
@@ -410,10 +450,7 @@ def build_shadowhand_cube_env_cfg(
         sim=SimulationCfg(
             nconmax=100,
             njmax=600,
-            mujoco=MujocoCfg(
-                timestep=0.002,
-                iterations=20,
-            ),
+            mujoco=MujocoCfg(timestep=0.002, iterations=20),
         ),
         decimation=20,
         episode_length_s=4.0,
@@ -423,259 +460,303 @@ def build_shadowhand_cube_env_cfg(
 
 
 # ---------------------------------------------------------------------------
-# Gymnasium baseline extraction
+# Gymnasium baseline (runs in main .venv via subprocess)
 # ---------------------------------------------------------------------------
 
-def get_gymnasium_baseline():
-    """Return a dict of key properties from Gymnasium cube-rotate-v1.
-
-    Runs in the main .venv via subprocess since the mjlab venv does not
-    have gymnasium installed.
-    """
-    import subprocess
-    import json
-
-    main_venv = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
-    if not main_venv.exists():
+def _run_in_main_venv(script: str, timeout: int = 30) -> str | None:
+    import subprocess, json
+    main_py = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
+    if not main_py.exists():
         return None
+    r = subprocess.run([str(main_py), "-c", script], capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        print(f"  subprocess error: {r.stderr[:300]}")
+        return None
+    for line in r.stdout.strip().split("\n"):
+        if line.strip().startswith("{"):
+            return line
+    return None
 
-    script = f"""
+
+def get_gymnasium_baseline():
+    import json
+    proj = str(Path(__file__).resolve().parent.parent)
+    raw = _run_in_main_venv(f"""
 import os, sys, json
 os.environ['MUJOCO_GL'] = 'egl'
-sys.path.insert(0, '{Path(__file__).resolve().parent.parent}')
-import gymnasium as gym
-import numpy as np
-import dex_envs
+sys.path.insert(0, '{proj}')
+import gymnasium as gym, numpy as np, dex_envs, mujoco
 from jaxrl.envs import FlattenObservationShadowhandWrapper
-
 env = gym.make('cube-rotate-v1', reward_type='sparse')
 wrapped = FlattenObservationShadowhandWrapper(env)
 obs, _ = wrapped.reset()
-e = env.unwrapped
-baseline = {{
-    "env_id": "cube-rotate-v1",
+e = env.unwrapped; m = e.model
+cube_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'object')
+print(json.dumps({{
     "obs_shape": list(obs.shape),
-    "obs_components": "24 joint_pos + 24 joint_vel + 3 obj_pos + 4 obj_quat + 3 obj_linvel + 3 obj_angvel + 3 goal_pos + 4 goal_quat",
     "action_shape": list(env.action_space.shape),
     "action_range": [float(env.action_space.low.min()), float(env.action_space.high.max())],
     "max_episode_steps": 100,
     "dt": e.dt,
-    "sim_timestep": float(e.model.opt.timestep),
+    "sim_timestep": float(m.opt.timestep),
     "n_substeps": int(e.n_substeps),
-    "reward_type": e.reward_type,
-    "reward_range": [-1.0, 0.0],
-    "success_metric": "is_success (rotation distance < 0.1 rad)",
     "rotation_threshold": float(e.rotation_threshold),
-    "distance_threshold": float(e.distance_threshold),
-    "target_rotation": e.target_rotation,
-    "target_position": e.target_position,
-    "randomize_initial_position": bool(e.randomize_initial_position),
-    "randomize_initial_rotation": bool(e.randomize_initial_rotation),
-    "num_joints": 24,
-    "num_actuators": 20,
-}}
+    "cube_mass": float(m.body_mass[cube_bid]),
+    "num_joints": 24, "num_actuators": 20,
+}}))
 env.close()
-print(json.dumps(baseline))
-"""
-    result = subprocess.run(
-        [str(main_venv), "-c", script],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        print(f"  Gymnasium baseline subprocess error: {result.stderr[:300]}")
-        return None
-
-    for line in result.stdout.strip().split("\n"):
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            continue
-    return None
+""")
+    return json.loads(raw) if raw else None
 
 
 # ---------------------------------------------------------------------------
 # Parity checks
 # ---------------------------------------------------------------------------
 
-def run_parity_checks():
+def run_checks():
     results = {}
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-    print()
+    print(f"Device: {device}\n")
 
-    # --- Build mjlab env ---
+    # ---------------------------------------------------------------
+    # Build env
+    # ---------------------------------------------------------------
     print("Building mjlab ShadowHand+cube env (num_envs=4) ...")
     cfg = build_shadowhand_cube_env_cfg(num_envs=4, auto_reset=False)
     env = ManagerBasedRlEnv(cfg, device=device)
-
-    print(f"  max_episode_length: {env.max_episode_length} steps")
-    print(f"  step_dt: {env.step_dt}s")
-    print(f"  episode_length_s: {cfg.episode_length_s}s")
-    print(f"  num_envs: {env.num_envs}")
-    print(f"  decimation: {cfg.decimation}")
-    print(f"  sim_timestep: {cfg.sim.mujoco.timestep}")
-    print()
-
-    # --- Check 1: env builds successfully ---
-    results["1_env_builds"] = True
-    print("[CHECK 1] PASS — mjlab env builds successfully")
-    print()
-
-    # --- Check 2: reset works ---
-    obs, info = env.reset()
-    policy_obs = obs["policy"]
-    print(f"[CHECK 2] Reset observation shape: {policy_obs.shape}")
-    print(f"  Expected: (num_envs, 68) = (4, 68)")
-    expected_obs_dim = 24 + 24 + 3 + 4 + 3 + 3 + 7  # = 68
-    obs_shape_ok = policy_obs.shape == (env.num_envs, expected_obs_dim)
-    results["2_reset_obs_shape"] = obs_shape_ok
-    if obs_shape_ok:
-        print(f"  PASS — obs shape matches Gymnasium (68 dims)")
-    else:
-        print(f"  FAIL — got {policy_obs.shape}, expected ({env.num_envs}, {expected_obs_dim})")
-    print()
-
-    # --- Check 3: action shape matches ---
     action_dim = env.action_manager.total_action_dim
-    print(f"[CHECK 3] Action dimension: {action_dim}")
-    action_ok = action_dim == 20
-    results["3_action_dim"] = action_ok
-    if action_ok:
-        print("  PASS — action dim matches Gymnasium (20)")
-    else:
-        print(f"  FAIL — got {action_dim}, expected 20")
+
+    print(f"  max_episode_length={env.max_episode_length}  step_dt={env.step_dt}  "
+          f"num_envs={env.num_envs}  decimation={cfg.decimation}")
     print()
 
-    # --- Check 4: step accepts actions and returns correct shapes ---
-    action = torch.zeros(env.num_envs, action_dim, device=device)
-    obs_buf, reward_buf, terminated, truncated, extras = env.step(action)
-    step_obs = obs_buf["policy"]
-    print(f"[CHECK 4] Step outputs:")
-    print(f"  obs shape: {step_obs.shape}")
-    print(f"  reward shape: {reward_buf.shape}")
-    print(f"  terminated shape: {terminated.shape}")
-    print(f"  truncated shape: {truncated.shape}")
-    step_ok = (
-        step_obs.shape == (env.num_envs, expected_obs_dim)
-        and reward_buf.shape == (env.num_envs,)
-        and terminated.shape == (env.num_envs,)
-        and truncated.shape == (env.num_envs,)
-    )
-    results["4_step_shapes"] = step_ok
-    if step_ok:
-        print("  PASS — all step output shapes correct")
-    else:
-        print("  FAIL")
-    print()
-
-    # --- Check 5: observation can be flattened into policy vector ---
-    flat_obs = step_obs
-    print(f"[CHECK 5] Flattened observation:")
-    print(f"  shape: {flat_obs.shape}")
-    print(f"  dtype: {flat_obs.dtype}")
-    print(f"  finite: {torch.isfinite(flat_obs).all().item()}")
-    flat_ok = flat_obs.shape[-1] == expected_obs_dim and torch.isfinite(flat_obs).all()
-    results["5_flat_obs_valid"] = bool(flat_ok)
-    if flat_ok:
-        print("  PASS — observation is a valid finite policy vector")
-    else:
-        print("  FAIL")
-
-    # Print observation breakdown
-    print(f"  Breakdown:")
-    idx = 0
-    for name, size in [
-        ("joint_pos", 24), ("joint_vel", 24),
-        ("object_pos", 3), ("object_quat", 4),
-        ("object_lin_vel", 3), ("object_ang_vel", 3),
-        ("desired_goal", 7),
-    ]:
-        vals = flat_obs[0, idx:idx+size]
-        print(f"    {name:20s} [{idx}:{idx+size}] mean={vals.mean():.4f} std={vals.std():.4f}")
-        idx += size
-    print()
-
-    # --- Check 6: terminated and truncated are separate ---
-    results["6_separate_term_trunc"] = True
-    print("[CHECK 6] PASS — terminated and truncated are separate tensors")
-    print()
-
-    # --- Check 7: timeout maps to BRC mask=1 ---
+    # ---------------------------------------------------------------
+    # CHECK 1: structural — env builds, obs/action shapes
+    # ---------------------------------------------------------------
     obs, _ = env.reset()
-    max_steps = env.max_episode_length
-    print(f"[CHECK 7] Running until timeout (max_steps={max_steps}) ...")
-    timeout_hit = False
-    for step_i in range(1, max_steps + 5):
-        action = torch.randn(env.num_envs, action_dim, device=device) * 0.1
-        obs_buf, reward_buf, terminated, truncated, extras = env.step(action)
+    policy_obs = obs["policy"]
+    expected_dim = 68
+    c1 = (policy_obs.shape == (env.num_envs, expected_dim) and action_dim == 20)
+    results["1_structural_shapes"] = c1
+    print(f"[CHECK 1] obs={policy_obs.shape} action_dim={action_dim} — {'PASS' if c1 else 'FAIL'}")
 
-        done_any = (terminated | truncated).any()
-        if truncated.any() and not timeout_hit:
+    # ---------------------------------------------------------------
+    # CHECK 2: step contract — shapes, finite, terminated/truncated
+    # ---------------------------------------------------------------
+    action = torch.zeros(env.num_envs, action_dim, device=device)
+    obs_buf, rew, term, trunc, _ = env.step(action)
+    step_obs = obs_buf["policy"]
+    c2 = (step_obs.shape == (4, 68) and rew.shape == (4,)
+           and term.shape == (4,) and trunc.shape == (4,)
+           and torch.isfinite(step_obs).all())
+    results["2_step_contract"] = bool(c2)
+    print(f"[CHECK 2] step shapes/finite — {'PASS' if c2 else 'FAIL'}")
+
+    # ---------------------------------------------------------------
+    # CHECK 3: episode length and timeout
+    # ---------------------------------------------------------------
+    obs, _ = env.reset()
+    timeout_hit = False
+    for step_i in range(1, env.max_episode_length + 5):
+        act = torch.randn(env.num_envs, action_dim, device=device) * 0.01
+        _, _, term, trunc, _ = env.step(act)
+        if trunc.any():
             timeout_hit = True
-            terms_np = terminated.cpu().numpy().astype(float)
-            truns_np = truncated.cpu().numpy().astype(float)
+            terms_np = term.cpu().numpy().astype(float)
+            truns_np = trunc.cpu().numpy().astype(float)
             masks = 1 - (terms_np * (1 - truns_np))
-            timeout_mask_correct = all(
-                masks[i] == 1.0 for i in range(len(truns_np)) if truns_np[i] == 1.0
-            )
-            results["7_timeout_mask"] = timeout_mask_correct
-            print(f"  Timeout at step {step_i}")
-            print(f"  terminated: {terms_np}")
-            print(f"  truncated:  {truns_np}")
-            print(f"  BRC masks:  {masks}")
-            print(f"  {'PASS' if timeout_mask_correct else 'FAIL'} — timeout maps to mask=1")
+            timeout_mask_ok = all(masks[i] == 1.0 for i in range(len(truns_np)) if truns_np[i])
+            break
+        if (term | trunc).any():
+            env.reset(env_ids=(term | trunc).nonzero(as_tuple=False).squeeze(-1))
+    c3 = timeout_hit and timeout_mask_ok and step_i == env.max_episode_length
+    results["3_timeout_mask"] = c3
+    print(f"[CHECK 3] timeout at step {step_i}, mask=1 — {'PASS' if c3 else 'FAIL'}")
+
+    # ---------------------------------------------------------------
+    # CHECK 4: action scaling parity
+    # ---------------------------------------------------------------
+    env.reset()
+    robot = env.scene["robot"]
+    mjlab_joint_names = robot.joint_names
+    mjlab_act_names = robot.actuator_names
+
+    # Find the ordering of the 20 actuated joints within the full 24
+    actuated_joint_indices = []
+    for jn in GYM_JOINT_ORDER:
+        idx = mjlab_joint_names.index(jn)
+        actuated_joint_indices.append(idx)
+
+    order_ok = (len(actuated_joint_indices) == 20)
+    if order_ok:
+        for i, (_, gj, _, _) in enumerate(GYM_ACTUATOR_ORDER):
+            if mjlab_joint_names[actuated_joint_indices[i]] != gj:
+                order_ok = False
+                break
+
+    max_diffs = []
+    for test_val in [-1.0, 0.0, 1.0]:
+        gym_targets = GYM_CTRL_CENTER + test_val * GYM_CTRL_HALFWIDTH
+        act_tensor = torch.full((env.num_envs, 20), test_val, device=device)
+        env.action_manager._terms["joint_pos"].process_actions(act_tensor)
+        mjlab_targets = env.action_manager._terms["joint_pos"]._processed_actions[0].cpu().numpy()
+        diff = np.abs(gym_targets - mjlab_targets)
+        max_diffs.append(diff.max())
+
+    rng = np.random.default_rng(42)
+    rand_actions = rng.uniform(-1, 1, size=(5, 20))
+    for ra in rand_actions:
+        gym_targets = GYM_CTRL_CENTER + ra * GYM_CTRL_HALFWIDTH
+        act_tensor = torch.tensor(ra, dtype=torch.float32, device=device).unsqueeze(0).expand(env.num_envs, -1)
+        env.action_manager._terms["joint_pos"].process_actions(act_tensor)
+        mjlab_targets = env.action_manager._terms["joint_pos"]._processed_actions[0].cpu().numpy()
+        diff = np.abs(gym_targets - mjlab_targets)
+        max_diffs.append(diff.max())
+
+    worst_action_diff = max(max_diffs)
+    c4 = order_ok and worst_action_diff < 1e-5
+    results["4_action_scaling"] = c4
+    print(f"[CHECK 4] action scaling: order_ok={order_ok} worst_diff={worst_action_diff:.2e} — {'PASS' if c4 else 'FAIL'}")
+
+    # ---------------------------------------------------------------
+    # CHECK 5: object physics — mass, freejoint damping
+    # ---------------------------------------------------------------
+    cube_entity = env.scene["cube"]
+    body_ids_local, _ = cube_entity.find_bodies("cube", preserve_order=True)
+    body_world_id = int(cube_entity.indexing.body_ids[body_ids_local[0]].item())
+    mjlab_cube_mass = float(env.sim.model.body_mass[0, body_world_id].item())
+    mass_diff = abs(mjlab_cube_mass - GYM_CUBE_MASS)
+    mass_ok = mass_diff < 0.001
+
+    # Free joints are not in entity.joint_names; query the model directly.
+    njnt = env.sim.model.njnt
+    damp_ok = False
+    mjlab_damp = -1.0
+    for ji in range(njnt):
+        jname = env.sim.model.jnt_names[ji] if hasattr(env.sim.model, 'jnt_names') else ""
+        jtype = int(env.sim.model.jnt_type[ji].item()) if env.sim.model.jnt_type.ndim == 1 else int(env.sim.model.jnt_type[0, ji].item())
+        if jtype == 0:  # mjJNT_FREE
+            dof_adr = int(env.sim.model.jnt_dofadr[ji].item())
+            mjlab_damp = float(env.sim.model.dof_damping[0, dof_adr].item())
+            damp_ok = abs(mjlab_damp - GYM_OBJ_FREEJOINT_DAMPING) < 1e-6
             break
 
-        if done_any:
-            done_ids = (terminated | truncated).nonzero(as_tuple=False).squeeze(-1)
-            env.reset(env_ids=done_ids)
+    c5 = mass_ok and damp_ok
+    results["5_object_physics"] = c5
+    print(f"[CHECK 5] cube mass: mjlab={mjlab_cube_mass:.6f} gym={GYM_CUBE_MASS:.6f} "
+          f"diff={mass_diff:.6f}  damp={mjlab_damp} — {'PASS' if c5 else 'FAIL'}")
 
-    if not timeout_hit:
-        results["7_timeout_mask"] = False
-        print(f"  FAIL — no timeout in {max_steps + 4} steps")
-    print()
+    # ---------------------------------------------------------------
+    # CHECK 6: reset randomization — position + yaw vary
+    # ---------------------------------------------------------------
+    positions = []
+    yaws = []
+    for _ in range(50):
+        env.reset()
+        cube = env.scene["cube"]
+        pos = cube.data.root_link_pos_w[0].cpu().numpy()
+        quat = cube.data.root_link_quat_w[0].cpu().numpy()
+        # yaw from quat: atan2(2*(w*z + x*y), 1 - 2*(y^2 + z^2))
+        w, x, y, z = quat
+        yaw = np.arctan2(2*(w*z + x*y), 1 - 2*(y**2 + z**2))
+        positions.append(pos)
+        yaws.append(yaw)
 
-    # --- Check 8: reward exists and is sparse ---
-    obs, _ = env.reset()
+    positions = np.array(positions)
+    yaws = np.array(yaws)
+    pos_range_x = positions[:, 0].max() - positions[:, 0].min()
+    pos_range_y = positions[:, 1].max() - positions[:, 1].min()
+    yaw_range = yaws.max() - yaws.min()
+
+    pos_varies = pos_range_x > 0.005 and pos_range_y > 0.005
+    yaw_varies = yaw_range > 3.0
+    c6 = pos_varies and yaw_varies
+    results["6_reset_randomization"] = c6
+    print(f"[CHECK 6] reset rand: pos_range_x={pos_range_x:.4f} pos_range_y={pos_range_y:.4f} "
+          f"yaw_range={yaw_range:.2f} rad — {'PASS' if c6 else 'FAIL'}")
+
+    # ---------------------------------------------------------------
+    # CHECK 7: reward/success formula — synthetic deterministic tests
+    # ---------------------------------------------------------------
+    print("[CHECK 7] reward/success formula tests:")
+    c7_all = True
+
+    def _check(label, q_ach, q_des, expect_rew, expect_suc):
+        nonlocal c7_all
+        qa = torch.tensor([q_ach], dtype=torch.float32)
+        qd = torch.tensor([q_des], dtype=torch.float32)
+        r = compute_sparse_reward(qa, qd, 0.1).item()
+        s = compute_is_success(qa, qd, 0.1).item()
+        ok = abs(r - expect_rew) < 1e-6 and abs(s - expect_suc) < 1e-6
+        if not ok:
+            c7_all = False
+        print(f"  {label}: reward={r:.1f} success={s:.1f} — {'PASS' if ok else 'FAIL'}")
+
+    # Exact match
+    _check("exact_match",
+           [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0],
+           0.0, 1.0)
+
+    # Gymnasium's source formula does not canonicalize antipodal signs with abs().
+    _check("antipodal_quaternion_gym_formula",
+           [1.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0],
+           -1.0, 0.0)
+
+    # Large rotation error (pi radians)
+    _check("pi_rotation_error",
+           [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0],
+           -1.0, 0.0)
+
+    # Just below threshold: 0.09 rad z-rotation
+    angle_below = 0.09
+    q_below = [np.cos(angle_below/2), 0.0, 0.0, np.sin(angle_below/2)]
+    _check("just_below_threshold (0.09 rad)",
+           [1.0, 0.0, 0.0, 0.0], q_below,
+           0.0, 1.0)
+
+    # Just above threshold: 0.11 rad z-rotation
+    angle_above = 0.11
+    q_above = [np.cos(angle_above/2), 0.0, 0.0, np.sin(angle_above/2)]
+    _check("just_above_threshold (0.11 rad)",
+           [1.0, 0.0, 0.0, 0.0], q_above,
+           -1.0, 0.0)
+
+    results["7_reward_success_formula"] = c7_all
+
+    # ---------------------------------------------------------------
+    # CHECK 8: success helper works with live env state
+    # ---------------------------------------------------------------
+    env.reset()
+    obj_quat = env.scene["cube"].data.root_link_quat_w
+    target = env._desired_goal_target[:, 3:]
+    is_suc = compute_is_success(obj_quat, target, 0.1)
+    c8 = is_suc.shape == (env.num_envs,) and torch.isfinite(is_suc).all()
+    results["8_success_helper_live"] = bool(c8)
+    print(f"[CHECK 8] success helper live: shape={is_suc.shape} values={is_suc.cpu().tolist()} — {'PASS' if c8 else 'FAIL'}")
+
+    # ---------------------------------------------------------------
+    # CHECK 9: sparse reward values
+    # ---------------------------------------------------------------
+    env.reset()
     rewards_collected = []
-    for _ in range(20):
-        action = torch.randn(env.num_envs, action_dim, device=device) * 0.1
-        _, rew, term, trunc, _ = env.step(action)
+    for _ in range(30):
+        act = torch.randn(env.num_envs, action_dim, device=device) * 0.01
+        _, rew, term, trunc, _ = env.step(act)
         rewards_collected.append(rew.cpu())
-        done = (term | trunc).any()
-        if done:
-            done_ids = (term | trunc).nonzero(as_tuple=False).squeeze(-1)
-            env.reset(env_ids=done_ids)
+        if (term | trunc).any():
+            env.reset(env_ids=(term | trunc).nonzero(as_tuple=False).squeeze(-1))
+    all_rew = torch.cat(rewards_collected)
+    unique = sorted(all_rew.unique().tolist())
+    c9 = all(v in (-1.0, 0.0) for v in unique)
+    results["9_reward_values"] = c9
+    print(f"[CHECK 9] reward unique values: {unique} — {'PASS' if c9 else 'FAIL'}")
 
-    all_rewards = torch.cat(rewards_collected)
-    unique_rewards = all_rewards.unique()
-    print(f"[CHECK 8] Rewards observed: {unique_rewards.tolist()}")
-    print(f"  min={all_rewards.min():.4f}, max={all_rewards.max():.4f}")
-    reward_ok = all_rewards.min() >= -1.1 and all_rewards.max() <= 0.1
-    results["8_reward_range"] = bool(reward_ok)
-    if reward_ok:
-        print("  PASS — reward range consistent with sparse [-1, 0]")
-    else:
-        print("  FAIL")
-    print()
-
-    # --- Check 9: batched num_envs > 1 works ---
-    results["9_batched_envs"] = True  # Already tested with num_envs=4
-    print("[CHECK 9] PASS — batched stepping with num_envs=4 works")
-    print()
-
-    # --- Check 10: episode length matches ---
-    ep_steps = int(cfg.episode_length_s / env.step_dt)
-    gymnasium_ep_steps = 100
-    ep_match = ep_steps == gymnasium_ep_steps
-    results["10_episode_length"] = ep_match
-    print(f"[CHECK 10] Episode length: mjlab={ep_steps}, Gymnasium={gymnasium_ep_steps}")
-    if ep_match:
-        print("  PASS")
-    else:
-        print(f"  MISMATCH — mjlab has {ep_steps} steps, Gymnasium has {gymnasium_ep_steps}")
-        print(f"  (episode_length_s={cfg.episode_length_s}, step_dt={env.step_dt})")
-    print()
+    # ---------------------------------------------------------------
+    # CHECK 10: episode length
+    # ---------------------------------------------------------------
+    c10 = int(cfg.episode_length_s / env.step_dt) == 100
+    results["10_episode_length"] = c10
+    print(f"[CHECK 10] episode_length={int(cfg.episode_length_s / env.step_dt)} — {'PASS' if c10 else 'FAIL'}")
 
     env.close()
     return results
@@ -686,20 +767,13 @@ def run_parity_checks():
 # ---------------------------------------------------------------------------
 
 def benchmark_gymnasium(num_steps=500):
-    """Benchmark Gymnasium cube-rotate-v1 via subprocess using the main venv."""
-    import subprocess
     import json
-
-    main_venv = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
-    if not main_venv.exists():
-        return None
-
-    script = f"""
+    proj = str(Path(__file__).resolve().parent.parent)
+    raw = _run_in_main_venv(f"""
 import os, sys, time, json
 os.environ['MUJOCO_GL'] = 'egl'
-sys.path.insert(0, '{Path(__file__).resolve().parent.parent}')
-import gymnasium as gym
-import dex_envs
+sys.path.insert(0, '{proj}')
+import gymnasium as gym, dex_envs
 env = gym.make('cube-rotate-v1', reward_type='sparse')
 obs, _ = env.reset()
 for _ in range(50):
@@ -713,69 +787,34 @@ dt = time.perf_counter() - t0
 env.close()
 sps = {num_steps} / dt
 print(json.dumps({{"steps": {num_steps}, "time_s": dt, "steps_per_sec": sps, "env_transitions_per_sec": sps}}))
-"""
-    result = subprocess.run(
-        [str(main_venv), "-c", script],
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0:
-        print(f"  Gymnasium benchmark subprocess failed: {result.stderr[:200]}")
-        return None
-
-    for line in result.stdout.strip().split("\n"):
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            continue
-    return None
+""", timeout=120)
+    return json.loads(raw) if raw else None
 
 
 def benchmark_mjlab(num_envs=64, num_steps=500):
-    """Benchmark mjlab batched stepping."""
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     cfg = build_shadowhand_cube_env_cfg(num_envs=num_envs, auto_reset=False)
     env = ManagerBasedRlEnv(cfg, device=device)
-    action_dim = env.action_manager.total_action_dim
-
-    obs, _ = env.reset()
-
-    # Warmup (includes kernel compilation)
+    dim = env.action_manager.total_action_dim
+    env.reset()
     for _ in range(50):
-        action = torch.randn(num_envs, action_dim, device=device) * 0.1
-        obs_buf, rew, term, trunc, extras = env.step(action)
-        done = (term | trunc).any()
-        if done:
-            done_ids = (term | trunc).nonzero(as_tuple=False).squeeze(-1)
-            env.reset(env_ids=done_ids)
-
+        _, _, t, tr, _ = env.step(torch.randn(num_envs, dim, device=device) * 0.01)
+        if (t | tr).any():
+            env.reset(env_ids=(t | tr).nonzero(as_tuple=False).squeeze(-1))
     if device != "cpu":
         torch.cuda.synchronize()
-
     t0 = time.perf_counter()
     for _ in range(num_steps):
-        action = torch.randn(num_envs, action_dim, device=device) * 0.1
-        obs_buf, rew, term, trunc, extras = env.step(action)
-        done = (term | trunc).any()
-        if done:
-            done_ids = (term | trunc).nonzero(as_tuple=False).squeeze(-1)
-            env.reset(env_ids=done_ids)
-
+        _, _, t, tr, _ = env.step(torch.randn(num_envs, dim, device=device) * 0.01)
+        if (t | tr).any():
+            env.reset(env_ids=(t | tr).nonzero(as_tuple=False).squeeze(-1))
     if device != "cpu":
         torch.cuda.synchronize()
-
     dt = time.perf_counter() - t0
     env.close()
-
-    sps = num_steps / dt
-    transitions = num_steps * num_envs
-    tps = transitions / dt
-    return {
-        "num_envs": num_envs,
-        "steps": num_steps,
-        "time_s": dt,
-        "steps_per_sec": sps,
-        "env_transitions_per_sec": tps,
-    }
+    return {"num_envs": num_envs, "steps": num_steps, "time_s": dt,
+            "steps_per_sec": num_steps / dt,
+            "env_transitions_per_sec": num_steps * num_envs / dt}
 
 
 # ---------------------------------------------------------------------------
@@ -787,43 +826,37 @@ def main():
     print("=" * 70)
     print("Single-Object ShadowHand mjlab Parity Prototype")
     print("=" * 70)
-    print()
-    print(f"mjlab version: {importlib.metadata.version('mjlab')}")
-    print(f"torch version: {torch.__version__}")
-    print(f"mujoco version: {mujoco.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f"mjlab={importlib.metadata.version('mjlab')}  "
+          f"torch={torch.__version__}  mujoco={mujoco.__version__}  "
+          f"CUDA={'yes: ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no'}")
     print()
 
-    # --- Gymnasium baseline ---
+    # Gymnasium baseline
     print("-" * 70)
-    print("Gymnasium Baseline: cube-rotate-v1")
+    print("Gymnasium Baseline")
     print("-" * 70)
-    try:
-        baseline = get_gymnasium_baseline()
+    baseline = get_gymnasium_baseline()
+    if baseline:
         for k, v in baseline.items():
             print(f"  {k}: {v}")
-        print()
-    except Exception as e:
-        print(f"  Could not load Gymnasium baseline: {e}")
-        baseline = None
+    else:
+        print("  (could not load)")
     print()
 
-    # --- Parity checks ---
+    # Parity checks
     print("-" * 70)
-    print("mjlab Parity Checks")
+    print("Parity Checks")
     print("-" * 70)
     try:
-        results = run_parity_checks()
+        results = run_checks()
     except Exception:
         traceback.print_exc()
         results = {}
     print()
 
-    # --- Summary ---
+    # Summary
     print("=" * 70)
-    print("PARITY CHECK SUMMARY")
+    print("SUMMARY")
     print("=" * 70)
     all_pass = True
     for key, val in results.items():
@@ -832,84 +865,52 @@ def main():
             all_pass = False
         print(f"  [{status}] {key}")
     print()
-
-    if all_pass:
-        print("ALL CHECKS PASSED")
-    else:
-        failed = [k for k, v in results.items() if not v]
-        print(f"SOME CHECKS FAILED: {failed}")
+    print("ALL CHECKS PASSED" if all_pass else f"FAILED: {[k for k, v in results.items() if not v]}")
     print()
 
-    # --- Throughput benchmark ---
+    # Throughput
     print("-" * 70)
-    print("Throughput Benchmark")
+    print("Throughput")
     print("-" * 70)
+    gym_bench = mj_bench = None
+    try:
+        print("Gymnasium (1 env, 500 steps) ...")
+        gym_bench = benchmark_gymnasium()
+        if gym_bench:
+            print(f"  {gym_bench['steps_per_sec']:.0f} steps/sec")
+    except Exception as e:
+        print(f"  failed: {e}")
 
     try:
-        print("Gymnasium (1 env, sequential, 500 steps) ...")
-        gym_bench = benchmark_gymnasium(num_steps=500)
-        print(f"  {gym_bench['steps_per_sec']:.1f} steps/sec "
-              f"({gym_bench['env_transitions_per_sec']:.1f} transitions/sec)")
+        for ne in [64]:
+            print(f"mjlab ({ne} envs, 500 steps) ...")
+            mj_bench = benchmark_mjlab(num_envs=ne)
+            print(f"  {mj_bench['steps_per_sec']:.0f} steps/sec  "
+                  f"({mj_bench['env_transitions_per_sec']:.0f} transitions/sec)")
     except Exception as e:
-        print(f"  Gymnasium benchmark failed: {e}")
-        gym_bench = None
-
-    try:
-        for n_envs in [32, 64]:
-            print(f"mjlab ({n_envs} envs, batched, 500 steps) ...")
-            mj_bench = benchmark_mjlab(num_envs=n_envs, num_steps=500)
-            print(f"  {mj_bench['steps_per_sec']:.1f} batched-steps/sec "
-                  f"({mj_bench['env_transitions_per_sec']:.1f} transitions/sec)")
-    except Exception as e:
-        print(f"  mjlab benchmark failed: {e}")
+        print(f"  failed: {e}")
         traceback.print_exc()
-        mj_bench = None
 
-    print()
     if gym_bench and mj_bench:
-        speedup = mj_bench['env_transitions_per_sec'] / gym_bench['env_transitions_per_sec']
-        print(f"Speedup: {speedup:.1f}x (mjlab {mj_bench['num_envs']} envs vs Gymnasium 1 env)")
+        su = mj_bench['env_transitions_per_sec'] / gym_bench['env_transitions_per_sec']
+        print(f"\nSpeedup: {su:.1f}x  (mjlab {mj_bench['num_envs']} envs vs Gymnasium 1 env)")
     print()
 
-    # --- Gaps & risks ---
+    # Remaining approximations
     print("-" * 70)
-    print("Known Gaps / Risks")
+    print("Remaining Approximations (not claimed as parity)")
     print("-" * 70)
     print("""
-  1. REWARD PARITY: The sparse reward implemented here computes rotation
-     distance the same way as Gymnasium (quat distance < 0.1 rad), but
-     the observation-frame quaternion convention needs verification.
-     Gymnasium uses (w,x,y,z) from MuJoCo; mjlab also returns (w,x,y,z)
-     from root_link_quat_w, so this should match.
-
-  2. SUCCESS METRIC: The success flag is not yet surfaced as an mjlab
-     metric or in step() extras. It would need a custom MetricsTermCfg
-     or a post-step check in the adapter.
-
-  3. RESET RANDOMIZATION: The Gymnasium env randomizes both initial
-     object position and rotation. The mjlab config randomizes position
-     but uses a fixed initial rotation. Full parity requires adding
-     rotation randomization to the reset event.
-
-  4. JOINT COUPLING: ShadowHand has 24 joints but only 20 actuators
-     (FFJ0/MFJ0/RFJ0/LFJ0 are coupled to FFJ1/MFJ1/RFJ1/LFJ1).
-     The Gymnasium env handles this in the actuator XML. mjlab should
-     preserve this coupling from the loaded spec, but the observation
-     will report 24 joint positions/velocities, same as Gymnasium.
-
-  5. DESIRED GOAL IN OBS: The desired_goal (target rotation) is included
-     in the observation vector. The target is re-sampled on reset.
-     This matches Gymnasium's behavior where the policy sees the target.
-
-  6. ACTION SEMANTICS: Gymnasium uses direct position-control actuators
-     with action range [-1, 1]. mjlab JointPositionAction maps actions
-     to position targets. The scale/offset may differ from Gymnasium's
-     actuator control mapping. The reference project uses delta-position
-     control instead. For parity, direct position control is used here,
-     matching the Gymnasium actuator setup.
-
-  7. PyTorch-to-JAX TRANSFER: Not tested here. The BRC loop requires
-     converting mjlab's PyTorch tensors to JAX arrays each step.
+  A. GEOM MARGINS: zeroed for MuJoCo Warp compatibility (was 0.0005).
+  B. ACTUATOR MODEL: Gymnasium uses MuJoCo general actuators (P-control,
+     Kd=0). mjlab uses IdealPd with stiffness matched but Kd=0 (matched).
+     effort_limits are rounded; forcerange is not identical.
+  C. JOINT COUPLING: FFJ0/MFJ0/RFJ0/LFJ0 coupled to J1 via equality
+     constraints. Preserved from the loaded ShadowHand spec.
+  D. PyTorch-to-JAX TRANSFER: not profiled.
+  E. RESET POSITION RANGE: mjlab uses ±0.01 for x/y; Gymnasium has
+     slightly different randomization via its own reset logic (wider
+     effective range due to sim settling). Not semantically critical.
 """)
 
     return all_pass
