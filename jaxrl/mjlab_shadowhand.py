@@ -66,6 +66,21 @@ GYM_CUBE_DENSITY = GYM_OBJ_DENSITY
 GYM_OBJ_FREEJOINT_DAMPING = 0.01
 
 STLS_DIR = (ASSETS_DIR / ".." / "stls" / "hand" / "contactdb_objects").resolve()
+YCB_DIR = (ASSETS_DIR / ".." / "stls" / "hand" / "ycb_objects").resolve()
+
+
+def _resolve_stl(object_name: str) -> Path:
+    """Find the STL file for an object in contactdb_objects or ycb_objects."""
+    p = STLS_DIR / f"{object_name}.stl"
+    if p.exists():
+        return p
+    p2 = YCB_DIR / f"{object_name}.stl"
+    if p2.exists():
+        return p2
+    raise FileNotFoundError(
+        f"Missing mesh for '{object_name}': checked {STLS_DIR} and {YCB_DIR}"
+    )
+
 
 OBJ_COLORS = {
     "cube": (0.8, 0.2, 0.2, 1.0),
@@ -166,9 +181,7 @@ def get_cube_spec() -> mujoco.MjSpec:
 
 def get_object_spec(object_name: str) -> mujoco.MjSpec:
     """Return a free-body mesh spec for any Gymnasium ShadowHand object."""
-    stl_path = (STLS_DIR / f"{object_name}.stl").resolve()
-    if not stl_path.exists():
-        raise FileNotFoundError(f"Missing mesh: {stl_path}")
+    stl_path = _resolve_stl(object_name)
 
     rgba = OBJ_COLORS.get(object_name, (0.6, 0.6, 0.6, 1.0))
     mesh_name = f"{object_name}_mesh"
@@ -483,7 +496,7 @@ def _make_asset_patcher(object_names: list[str], entity_prefix: str):
     """
     asset_data = {}
     for name in object_names:
-        stl_path = (STLS_DIR / f"{name}.stl").resolve()
+        stl_path = _resolve_stl(name)
         basename = f"{name}.stl"
         prefixed_key = f"{entity_prefix}/{basename}"
         asset_data[prefixed_key] = stl_path.read_bytes()

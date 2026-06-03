@@ -263,13 +263,14 @@ raycast conditioning remains the dominant runtime cost.
 4. **Single-object batched training smoke test.** Train `none` mode with many
    parallel slots of one object. Confirm replay insertion, reward normalization,
    and evaluation are stable.
-5. **Multi-object mesh-variant prototype.** Build a small set of compatible
-   objects in one mjlab env using per-world mesh variants. Verify object-id
-   assignment, balanced sampling, per-object logging, and held-out-object
-   evaluation. The current adapter now exposes deterministic slot metadata
-   (`object_ids`, `object_names_by_slot`, and `slot_counts_by_object`), but
-   replay sampling, reward normalization, and logging still need to consume
-   object ids rather than raw slot ids.
+5. **Multi-object mjlab prototype.** The single-`VariantEntityCfg` path is
+   correct but not viable for 85-object training: many distinct mesh variants in
+   one batched simulation trigger slow mesh-collision narrowphase behavior. The
+   current alternative is `ShardedMjlabParallelEnv`, which creates one
+   homogeneous mjlab shard per object and exposes deterministic slot metadata
+   (`object_ids`, `object_names_by_slot`, and `slot_counts_by_object`). Replay
+   sampling, reward normalization, and logging still need to consume object ids
+   rather than raw slot ids before final multi-object experiments.
 6. **Conditioner port.** Add batched `mesh_shape`, `mesh_pose`, and
    `wrist_raycast` extraction from mjlab state/sensors. Confirm the same
    checkpoints can run online.
@@ -282,37 +283,47 @@ raycast conditioning remains the dominant runtime cost.
 
 ## 9. Current Prototype Status
 
-The mjlab path now supports one-object and small multi-object training smokes
-with `conditioning_mode=none`. The strongest current evidence is:
+The mjlab path now has two multi-object implementations:
+
+- `mjlab`: one batched env with per-world mesh variants. This path is correct
+  but too slow for 85-object training because throughput collapses as the number
+  of distinct meshes grows.
+- `mjlab_sharded`: one homogeneous mjlab env per object, stepped sequentially.
+  This avoids heterogeneous-mesh divergence and is the current candidate for
+  large-object-count training.
+
+The strongest current evidence is:
 
 - reset/truncation contract checks pass with `auto_reset=False`;
 - cube-only 50k training no longer uses early object-fall terminations and
   reaches nontrivial sparse success;
-- a 3-object `cube,ball,apple` environment builds as one batched mjlab env;
-- a 3-object, 12-slot, 10k-step training smoke runs end-to-end;
-- the adapter exposes deterministic slot-to-object metadata in caller order.
+- 85 train objects construct and pass reset/step/reward/goal/timeout checks;
+- raw mjlab stepping is fast for homogeneous shards and slow for 85 variants in
+  one env;
+- `mjlab_sharded` passes 3-object and 85-object correctness smokes for
+  `conditioning_mode=none`.
 
-This is enough to justify an 85-object construction and short-rollout
-diagnostic. It is not yet enough to launch final 85-object policy comparisons,
-because object-aware replay balancing, reward normalization, and per-object
-metrics are still pending.
+This is enough to justify a measured sharded training smoke with larger
+per-object slot counts. It is not yet enough to launch final policy
+comparisons, because object-aware replay balancing, reward normalization,
+per-object metrics, and the update/transition schedule are still pending.
 
 ## 10. Immediate Recommendation
 
-Proceed to an 85-object mjlab feasibility diagnostic before launching more full
-85-object CPU training. The diagnostic should build the full train split,
-verify slot counts and object-id metadata, run reset/step/timeout checks, and
-measure short-rollout throughput.
+Proceed with a sharded training diagnostic before any full teacher run. Test
+`SHADOWHAND_TRAIN` with at least 16 and 64 env slots per object, reduced replay
+capacity, and explicit timing of environment step, replay insertion/sampling,
+reward normalization, action sampling, and BRC updates.
 
 The decision criterion is:
 
-- if the one-object mjlab path preserves observations, rewards, resets,
-  success, and timeout masks, continue to multi-object variants;
-- if the adapter cannot preserve timeout next observations or requires changing
-  BRC's mask semantics, do not use it for BRC without an explicit algorithmic
-  change;
-- if PyTorch-to-JAX transfer dominates runtime, test DLPack or a Torch-side
-  frozen conditioner before porting all objects.
+- if sharded env stepping plus BRC updates beats the CPU baseline after
+  normalizing by transitions and gradient updates, continue to object-aware
+  replay/logging;
+- if BRC updates dominate at high slot counts, tune `updates_per_step`, batch
+  size, and replay capacity before collecting long runs;
+- if memory or construction overhead is limiting, test fewer envs per object or
+  multi-GPU/object-group sharding.
 
 ## 11. Evidence Checked
 
