@@ -266,7 +266,10 @@ raycast conditioning remains the dominant runtime cost.
 5. **Multi-object mesh-variant prototype.** Build a small set of compatible
    objects in one mjlab env using per-world mesh variants. Verify object-id
    assignment, balanced sampling, per-object logging, and held-out-object
-   evaluation.
+   evaluation. The current adapter now exposes deterministic slot metadata
+   (`object_ids`, `object_names_by_slot`, and `slot_counts_by_object`), but
+   replay sampling, reward normalization, and logging still need to consume
+   object ids rather than raw slot ids.
 6. **Conditioner port.** Add batched `mesh_shape`, `mesh_pose`, and
    `wrist_raycast` extraction from mjlab state/sensors. Confirm the same
    checkpoints can run online.
@@ -277,12 +280,29 @@ raycast conditioning remains the dominant runtime cost.
    semantic drift, update `plan.md` and make mjlab the default path for large
    runs.
 
-## 9. Immediate Recommendation
+## 9. Current Prototype Status
 
-Proceed with a small mjlab adapter prototype before launching more full
-85-object CPU training. The first prototype should not try to solve the full
-multi-object problem. It should prove the reset/truncation contract and one
-batched ShadowHand object under `auto_reset=False`.
+The mjlab path now supports one-object and small multi-object training smokes
+with `conditioning_mode=none`. The strongest current evidence is:
+
+- reset/truncation contract checks pass with `auto_reset=False`;
+- cube-only 50k training no longer uses early object-fall terminations and
+  reaches nontrivial sparse success;
+- a 3-object `cube,ball,apple` environment builds as one batched mjlab env;
+- a 3-object, 12-slot, 10k-step training smoke runs end-to-end;
+- the adapter exposes deterministic slot-to-object metadata in caller order.
+
+This is enough to justify an 85-object construction and short-rollout
+diagnostic. It is not yet enough to launch final 85-object policy comparisons,
+because object-aware replay balancing, reward normalization, and per-object
+metrics are still pending.
+
+## 10. Immediate Recommendation
+
+Proceed to an 85-object mjlab feasibility diagnostic before launching more full
+85-object CPU training. The diagnostic should build the full train split,
+verify slot counts and object-id metadata, run reset/step/timeout checks, and
+measure short-rollout throughput.
 
 The decision criterion is:
 
@@ -294,7 +314,7 @@ The decision criterion is:
 - if PyTorch-to-JAX transfer dominates runtime, test DLPack or a Torch-side
   frozen conditioner before porting all objects.
 
-## 10. Evidence Checked
+## 11. Evidence Checked
 
 - Current BRC loop: `train.py`, `jaxrl/envs.py`, `jaxrl/replay_buffer.py`,
   `jaxrl/normalizer.py`, `jaxrl/agent/update.py`.

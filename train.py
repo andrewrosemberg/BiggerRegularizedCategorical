@@ -64,10 +64,6 @@ def main(_):
     env_names = get_environment_list(FLAGS.env_names)
 
     if FLAGS.env_backend == 'mjlab':
-        unsupported = [n for n in env_names if n != 'cube']
-        if unsupported:
-            print(f"Error: mjlab backend only supports cube; got {unsupported}", file=sys.stderr)
-            sys.exit(1)
         if FLAGS.conditioning_mode != 'none':
             print(f"Error: mjlab backend requires --conditioning_mode=none; got {FLAGS.conditioning_mode}", file=sys.stderr)
             sys.exit(1)
@@ -79,6 +75,7 @@ def main(_):
             FLAGS.render = False
         from jaxrl.mjlab_envs import MjlabParallelEnv
         env = MjlabParallelEnv(env_names, seed=FLAGS.seed, num_envs=FLAGS.mjlab_num_envs)
+        print(f"mjlab object slot counts: {env.slot_counts_by_object}")
         eval_env = None
     else:
         env = ParallelEnv(env_names, seed=FLAGS.seed)

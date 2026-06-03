@@ -28,6 +28,37 @@ from jaxrl.mjlab_shadowhand import (
 )
 
 
+def _unique_preserve_order(names: list[str]) -> list[str]:
+    """Return unique names in first-seen order."""
+    unique = []
+    seen = set()
+    for name in names:
+        if name not in seen:
+            unique.append(name)
+            seen.add(name)
+    return unique
+
+
+def _balanced_variant_assignment(num_objects: int, num_envs: int) -> np.ndarray:
+    """Assign env slots as evenly as possible across object indices.
+
+    Slots are grouped by object in the same order as the object list. For
+    example, 3 objects and 8 slots gives [0, 0, 0, 1, 1, 1, 2, 2].
+    """
+    if num_objects <= 0:
+        raise ValueError(f"num_objects must be positive, got {num_objects}.")
+    if num_envs <= 0:
+        raise ValueError(f"num_envs must be positive, got {num_envs}.")
+
+    base = num_envs // num_objects
+    remainder = num_envs % num_objects
+    assignment = []
+    for object_id in range(num_objects):
+        count = base + (1 if object_id < remainder else 0)
+        assignment.extend([object_id] * count)
+    return np.asarray(assignment, dtype=np.int32)
+
+
 class _FakeGymSpace:
     """Minimal shim so train.py can read .shape, .sample(), .low, .high, .dtype."""
 
@@ -71,15 +102,35 @@ class MjlabParallelEnv:
         if n <= 0:
             raise ValueError(f"num_envs must be positive, got {n}.")
 
-        unique_objects = sorted(set(names))
+        unique_objects = _unique_preserve_order(names)
         if unique_objects == ["cube"]:
             self._obj_entity_name = "cube"
+            self.unique_object_names = tuple(unique_objects)
+            self.object_ids = np.zeros(n, dtype=np.int32)
+            self.object_names_by_slot = np.asarray(["cube"] * n, dtype=object)
             cfg = build_shadowhand_cube_env_cfg(num_envs=n, auto_reset=False)
         else:
             self._obj_entity_name = "object"
-            cfg = build_shadowhand_multiobject_env_cfg(
-                object_names=unique_objects, num_envs=n, auto_reset=False,
+            variant_assignment = _balanced_variant_assignment(len(unique_objects), n)
+            self.unique_object_names = tuple(unique_objects)
+            self.object_ids = variant_assignment.copy()
+            self.object_names_by_slot = np.asarray(
+                [unique_objects[i] for i in variant_assignment],
+                dtype=object,
             )
+            cfg = build_shadowhand_multiobject_env_cfg(
+                object_names=unique_objects,
+                num_envs=n,
+                auto_reset=False,
+                variant_assignment=variant_assignment.tolist(),
+            )
+        self.object_id_by_name = {
+            name: idx for idx, name in enumerate(self.unique_object_names)
+        }
+        self.slot_counts_by_object = {
+            name: int(np.sum(self.object_names_by_slot == name))
+            for name in self.unique_object_names
+        }
 
         self._env = ManagerBasedRlEnv(cfg, device=device)
         self._device = device

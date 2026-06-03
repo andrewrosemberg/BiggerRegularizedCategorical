@@ -501,6 +501,7 @@ def build_shadowhand_multiobject_env_cfg(
     object_names: list[str],
     num_envs: int = 12,
     auto_reset: bool = False,
+    variant_assignment: list[int] | tuple[int, ...] | None = None,
 ) -> ManagerBasedRlEnvCfg:
     """Build a batched mjlab env with heterogeneous object meshes per world.
 
@@ -508,6 +509,28 @@ def build_shadowhand_multiobject_env_cfg(
     env slots within one batched ManagerBasedRlEnv. All variants share
     the same kinematic structure (single free-body with mesh geom).
     """
+    if variant_assignment is not None:
+        assignment = tuple(int(v) for v in variant_assignment)
+        if len(assignment) != num_envs:
+            raise ValueError(
+                f"variant_assignment length {len(assignment)} != num_envs {num_envs}."
+            )
+        if any(v < 0 or v >= len(object_names) for v in assignment):
+            raise ValueError(
+                "variant_assignment entries must index object_names; "
+                f"got {assignment} for {len(object_names)} objects."
+            )
+
+        def assignment_fn(nworld: int, assignment=assignment):
+            if nworld != len(assignment):
+                raise ValueError(
+                    f"assignment requested for {nworld} worlds, "
+                    f"but fixed assignment has {len(assignment)} worlds."
+                )
+            return assignment
+    else:
+        assignment_fn = None
+
     variants = {
         name: (lambda n=name: get_object_spec(n))
         for name in object_names
@@ -518,6 +541,7 @@ def build_shadowhand_multiobject_env_cfg(
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
         variants=variants,
+        assignment=assignment_fn,
     )
     cfg = _build_env_cfg(
         obj_entity_name="object",
