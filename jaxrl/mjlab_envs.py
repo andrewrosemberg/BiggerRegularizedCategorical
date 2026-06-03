@@ -10,8 +10,8 @@ Presents the subset of the ParallelEnv API used by the online training loop:
   .num_tasks            -> int
   .envs                 -> list  (placeholder for conditioner compat)
 
-The current implementation is intentionally cube-only and does not implement
-offline evaluation or geometry-conditioner access to per-env MuJoCo internals.
+Supports single-object (cube, backward-compat) and multi-object modes
+using VariantEntityCfg for heterogeneous mesh variants per env slot.
 Requires the mjlab virtualenv (.venv_mjlab_check).
 """
 
@@ -23,6 +23,7 @@ from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 
 from jaxrl.mjlab_shadowhand import (
     build_shadowhand_cube_env_cfg,
+    build_shadowhand_multiobject_env_cfg,
     compute_is_success,
 )
 
@@ -43,7 +44,12 @@ class _FakeGymSpace:
 
 
 class MjlabParallelEnv:
-    """Single-object mjlab adapter matching ParallelEnv's API."""
+    """mjlab adapter matching ParallelEnv's API.
+
+    Supports single-object (cube-only, backward-compat) and multi-object
+    (heterogeneous mesh variants) modes. In multi-object mode a single
+    batched ManagerBasedRlEnv is used with VariantEntityCfg.
+    """
 
     def __init__(
         self,
@@ -57,22 +63,24 @@ class MjlabParallelEnv:
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
         names = list(env_names) if env_names else ["cube"]
-        unsupported = sorted({name for name in names if name != "cube"})
-        if unsupported:
-            raise NotImplementedError(
-                "MjlabParallelEnv currently supports only the cube object; "
-                f"got unsupported env_names={unsupported}."
-            )
 
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        self._object_name = "cube"
         n = num_envs if num_envs is not None else len(names)
         if n <= 0:
             raise ValueError(f"num_envs must be positive, got {n}.")
 
-        cfg = build_shadowhand_cube_env_cfg(num_envs=n, auto_reset=False)
+        unique_objects = sorted(set(names))
+        if unique_objects == ["cube"]:
+            self._obj_entity_name = "cube"
+            cfg = build_shadowhand_cube_env_cfg(num_envs=n, auto_reset=False)
+        else:
+            self._obj_entity_name = "object"
+            cfg = build_shadowhand_multiobject_env_cfg(
+                object_names=unique_objects, num_envs=n, auto_reset=False,
+            )
+
         self._env = ManagerBasedRlEnv(cfg, device=device)
         self._device = device
         self._action_dim = self._env.action_manager.total_action_dim
@@ -118,7 +126,7 @@ class MjlabParallelEnv:
         term_np = term.cpu().numpy().astype(np.float64)
         trunc_np = trunc.cpu().numpy().astype(np.float64)
 
-        obj_quat = self._env.scene["cube"].data.root_link_quat_w
+        obj_quat = self._env.scene[self._env._obj_entity_name].data.root_link_quat_w
         target_quat = self._env._desired_goal_target[:, 3:]
         goals_np = compute_is_success(obj_quat, target_quat, 0.1).cpu().numpy().astype(np.float64)
 

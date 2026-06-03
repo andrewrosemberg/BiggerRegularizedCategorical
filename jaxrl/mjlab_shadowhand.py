@@ -1,8 +1,8 @@
-"""mjlab ShadowHand cube environment components.
+"""mjlab ShadowHand environment components.
 
-This module contains the reusable mjlab configuration for the cube rotation
-task used by the adapter checks. It intentionally supports only the cube
-object for now; multi-object support needs separate mesh/spec handling.
+This module contains the reusable mjlab configuration for the object rotation
+task. Supports single-object (cube) and multi-object (heterogeneous mesh
+variants via VariantEntityCfg) configurations.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import mujoco
 import numpy as np
 import torch
 from mjlab.actuator import IdealPdActuatorCfg
-from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+from mjlab.entity import EntityArticulationInfoCfg, EntityCfg, VariantEntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -61,8 +61,17 @@ GYM_CTRL_CENTER = (GYM_CTRL_HI + GYM_CTRL_LO) / 2.0
 GYM_CTRL_HALFWIDTH = (GYM_CTRL_HI - GYM_CTRL_LO) / 2.0
 
 GYM_CUBE_MASS = 0.15575129663498727
-GYM_CUBE_DENSITY = 567
+GYM_OBJ_DENSITY = 567
+GYM_CUBE_DENSITY = GYM_OBJ_DENSITY
 GYM_OBJ_FREEJOINT_DAMPING = 0.01
+
+STLS_DIR = (ASSETS_DIR / ".." / "stls" / "hand" / "contactdb_objects").resolve()
+
+OBJ_COLORS = {
+    "cube": (0.8, 0.2, 0.2, 1.0),
+    "ball": (0.2, 0.2, 0.8, 1.0),
+    "apple": (0.2, 0.8, 0.2, 1.0),
+}
 
 SHADOWHAND_ACTUATED_JOINTS = GYM_JOINT_ORDER
 SHADOWHAND_WRIST_JOINTS = ("robot0:WRJ1", "robot0:WRJ0")
@@ -152,26 +161,33 @@ def make_shadowhand_articulation() -> EntityArticulationInfoCfg:
 
 def get_cube_spec() -> mujoco.MjSpec:
     """Return a free-body mesh cube matching the Gymnasium cube mass."""
-    cube_stl = (
-        ASSETS_DIR / ".." / "stls" / "hand" / "contactdb_objects" / "cube.stl"
-    ).resolve()
-    if not cube_stl.exists():
-        raise FileNotFoundError(f"Missing mesh: {cube_stl}")
+    return get_object_spec("cube")
+
+
+def get_object_spec(object_name: str) -> mujoco.MjSpec:
+    """Return a free-body mesh spec for any Gymnasium ShadowHand object."""
+    stl_path = (STLS_DIR / f"{object_name}.stl").resolve()
+    if not stl_path.exists():
+        raise FileNotFoundError(f"Missing mesh: {stl_path}")
+
+    rgba = OBJ_COLORS.get(object_name, (0.6, 0.6, 0.6, 1.0))
+    mesh_name = f"{object_name}_mesh"
+    stl_basename = f"{object_name}.stl"
 
     spec = mujoco.MjSpec()
-    spec.add_mesh(name="cube_mesh", file=str(cube_stl))
-    body = spec.worldbody.add_body(name="cube")
-    free_joint = body.add_freejoint(name="cube_joint")
+    spec.add_mesh(name=mesh_name, file=stl_basename)
+    body = spec.worldbody.add_body(name="object")
+    free_joint = body.add_freejoint(name="object_joint")
     free_joint.damping = np.full(3, GYM_OBJ_FREEJOINT_DAMPING)
     body.add_geom(
-        name="cube_geom",
+        name="object_geom",
         type=mujoco.mjtGeom.mjGEOM_MESH,
-        meshname="cube_mesh",
-        density=GYM_CUBE_DENSITY,
+        meshname=mesh_name,
+        density=GYM_OBJ_DENSITY,
         condim=4,
-        rgba=(0.8, 0.2, 0.2, 1.0),
+        rgba=rgba,
     )
-    spec.assets = {os.path.basename(str(cube_stl)): cube_stl.read_bytes()}
+    spec.assets = {stl_basename: stl_path.read_bytes()}
     return spec
 
 
@@ -240,11 +256,21 @@ def object_root_ang_vel(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> to
     return env.scene[asset_cfg.name].data.root_link_ang_vel_w
 
 
+def _find_obj_entity_name(env: ManagerBasedRlEnv) -> str:
+    """Discover the object entity name from the scene."""
+    for name in env.scene.entities:
+        if name not in ("robot", "terrain"):
+            return name
+    raise KeyError("No object entity found in scene")
+
+
 class desired_goal_obs:
     """Random z-axis target rotation observation re-sampled on reset."""
 
     def __init__(self, cfg, env: ManagerBasedRlEnv):
         self._env = env
+        self._obj_entity_name = _find_obj_entity_name(env)
+        env._obj_entity_name = self._obj_entity_name
         self._target = torch.zeros((env.num_envs, 7), device=env.device)
         env._desired_goal_target = self._target
         self.reset(None)
@@ -253,8 +279,8 @@ class desired_goal_obs:
         if env_ids is None:
             env_ids = torch.arange(self._env.num_envs, device=self._env.device)
         n = len(env_ids)
-        cube = self._env.scene["cube"]
-        obj_pos = cube.data.root_link_pos_w[env_ids]
+        obj = self._env.scene[self._obj_entity_name]
+        obj_pos = obj.data.root_link_pos_w[env_ids]
         angles = torch.rand(n, device=self._env.device) * 2 * torch.pi - torch.pi
         zeros = torch.zeros(n, device=self._env.device)
         qw = torch.cos(angles / 2)
@@ -271,6 +297,7 @@ class sparse_rotation_reward:
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
         self._env = env
+        self._obj_entity_name = _find_obj_entity_name(env)
 
     def reset(self, env_ids):
         pass
@@ -281,7 +308,7 @@ class sparse_rotation_reward:
         rotation_threshold: float = 0.1,
     ) -> torch.Tensor:
         target = env._desired_goal_target
-        obj_quat = env.scene["cube"].data.root_link_quat_w
+        obj_quat = env.scene[self._obj_entity_name].data.root_link_quat_w
         return compute_sparse_reward(obj_quat, target[:, 3:], rotation_threshold)
 
 
@@ -295,13 +322,15 @@ def action_scale_offset() -> tuple[dict[str, float], dict[str, float]]:
     return scale, offset
 
 
-def build_shadowhand_cube_env_cfg(
+def _build_env_cfg(
     *,
-    num_envs: int = 4,
-    auto_reset: bool = False,
+    obj_entity_name: str,
+    obj_entity_cfg: EntityCfg,
+    num_envs: int,
+    auto_reset: bool,
 ) -> ManagerBasedRlEnvCfg:
-    """Build the batched mjlab cube-rotation environment configuration."""
-    cube_pos = (1.0, 0.87, 0.2)
+    """Shared builder for single- and multi-object ShadowHand configs."""
+    obj_pos = (1.0, 0.87, 0.2)
     act_scale, act_offset = action_scale_offset()
 
     observations = {
@@ -317,19 +346,19 @@ def build_shadowhand_cube_env_cfg(
                 ),
                 "object_pos": ObservationTermCfg(
                     func=object_root_pos,
-                    params={"asset_cfg": SceneEntityCfg("cube")},
+                    params={"asset_cfg": SceneEntityCfg(obj_entity_name)},
                 ),
                 "object_quat": ObservationTermCfg(
                     func=object_root_quat,
-                    params={"asset_cfg": SceneEntityCfg("cube")},
+                    params={"asset_cfg": SceneEntityCfg(obj_entity_name)},
                 ),
                 "object_lin_vel": ObservationTermCfg(
                     func=object_root_lin_vel,
-                    params={"asset_cfg": SceneEntityCfg("cube")},
+                    params={"asset_cfg": SceneEntityCfg(obj_entity_name)},
                 ),
                 "object_ang_vel": ObservationTermCfg(
                     func=object_root_ang_vel,
-                    params={"asset_cfg": SceneEntityCfg("cube")},
+                    params={"asset_cfg": SceneEntityCfg(obj_entity_name)},
                 ),
                 "desired_goal": ObservationTermCfg(func=desired_goal_obs),
             },
@@ -366,11 +395,11 @@ def build_shadowhand_cube_env_cfg(
                 "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
             },
         ),
-        "reset_cube_pose": EventTermCfg(
+        "reset_object_pose": EventTermCfg(
             func=envs_mdp.reset_root_state_uniform,
             mode="reset",
             params={
-                "asset_cfg": SceneEntityCfg("cube"),
+                "asset_cfg": SceneEntityCfg(obj_entity_name),
                 "pose_range": {
                     "x": (-0.01, 0.01),
                     "y": (-0.01, 0.01),
@@ -403,13 +432,7 @@ def build_shadowhand_cube_env_cfg(
                     spec_fn=get_shadowhand_spec,
                     articulation=make_shadowhand_articulation(),
                 ),
-                "cube": EntityCfg(
-                    init_state=EntityCfg.InitialStateCfg(
-                        pos=cube_pos,
-                        rot=(1.0, 0.0, 0.0, 0.0),
-                    ),
-                    spec_fn=get_cube_spec,
-                ),
+                obj_entity_name: obj_entity_cfg,
             },
             num_envs=num_envs,
             env_spacing=2.5,
@@ -429,3 +452,78 @@ def build_shadowhand_cube_env_cfg(
         auto_reset=auto_reset,
         scale_rewards_by_dt=False,
     )
+
+
+def build_shadowhand_cube_env_cfg(
+    *,
+    num_envs: int = 4,
+    auto_reset: bool = False,
+) -> ManagerBasedRlEnvCfg:
+    """Build the batched mjlab cube-rotation environment configuration."""
+    return _build_env_cfg(
+        obj_entity_name="cube",
+        obj_entity_cfg=EntityCfg(
+            init_state=EntityCfg.InitialStateCfg(
+                pos=(1.0, 0.87, 0.2),
+                rot=(1.0, 0.0, 0.0, 0.0),
+            ),
+            spec_fn=get_cube_spec,
+        ),
+        num_envs=num_envs,
+        auto_reset=auto_reset,
+    )
+
+
+def _make_asset_patcher(object_names: list[str], entity_prefix: str):
+    """Return a spec_fn callback that injects all object STL assets.
+
+    VariantEntityCfg's merge keeps only variant 0's assets dict. This
+    callback patches the scene spec to include all variant mesh data
+    after entity attachment but before simulation compilation.
+    """
+    asset_data = {}
+    for name in object_names:
+        stl_path = (STLS_DIR / f"{name}.stl").resolve()
+        basename = f"{name}.stl"
+        prefixed_key = f"{entity_prefix}/{basename}"
+        asset_data[prefixed_key] = stl_path.read_bytes()
+
+    def patch_assets(spec: mujoco.MjSpec) -> None:
+        if spec.assets is None:
+            spec.assets = {}
+        spec.assets.update(asset_data)
+
+    return patch_assets
+
+
+def build_shadowhand_multiobject_env_cfg(
+    *,
+    object_names: list[str],
+    num_envs: int = 12,
+    auto_reset: bool = False,
+) -> ManagerBasedRlEnvCfg:
+    """Build a batched mjlab env with heterogeneous object meshes per world.
+
+    Uses VariantEntityCfg to assign different object meshes to different
+    env slots within one batched ManagerBasedRlEnv. All variants share
+    the same kinematic structure (single free-body with mesh geom).
+    """
+    variants = {
+        name: (lambda n=name: get_object_spec(n))
+        for name in object_names
+    }
+    obj_entity_cfg = VariantEntityCfg(
+        init_state=EntityCfg.InitialStateCfg(
+            pos=(1.0, 0.87, 0.2),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+        variants=variants,
+    )
+    cfg = _build_env_cfg(
+        obj_entity_name="object",
+        obj_entity_cfg=obj_entity_cfg,
+        num_envs=num_envs,
+        auto_reset=auto_reset,
+    )
+    cfg.scene.spec_fn = _make_asset_patcher(object_names, "object")
+    return cfg
