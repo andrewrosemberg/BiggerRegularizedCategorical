@@ -263,9 +263,11 @@ class BRC(object):
             task_ids=batch.task_ids,
         )
 
-    def sample_actions(self, observations: np.ndarray, temperature: float = 1.0):
-        observations = self._augment_obs(observations, self.task_ids)
-        inputs = build_actor_input(self.critic, observations, self.task_ids, self.multitask)
+    def sample_actions(self, observations: np.ndarray, temperature: float = 1.0, task_ids=None):
+        if task_ids is None:
+            task_ids = self.task_ids
+        observations = self._augment_obs(observations, task_ids)
+        inputs = build_actor_input(self.critic, observations, task_ids, self.multitask)
         rng, actions = _sample_actions(self.rng, self.actor, inputs, temperature)
         self.rng = rng
         actions = np.asarray(actions)

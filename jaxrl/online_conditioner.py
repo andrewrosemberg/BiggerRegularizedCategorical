@@ -238,3 +238,142 @@ def build_raycast_conditioner(
         encoder_params=encoder_params,
         raycast_config=config,
     )
+
+
+class ShardedRaycastConditioner:
+    """Online raycast conditioner for ShardedMjlabParallelEnv.
+
+    Reads GPU-native raycast sensor data from mjlab shards (no CPU mj_ray).
+    Encodes per-step pointclouds with a MaskAwarePointNet. The inference
+    contract is sensor-only: no object ID, no object pose, no mesh geometry.
+
+    Frame handling:
+    - If ``palm_frame=True`` and the palm body is accessible, hit positions
+      are transformed to palm frame before encoding.
+    - If palm body data is unavailable, falls back to world-frame and
+      prints a warning. The ``frame`` attribute records which was used.
+    """
+
+    def __init__(
+        self,
+        encoder_def: MaskAwarePointNet,
+        encoder_params,
+        normalize_scale: float = NORMALIZATION_SCALE,
+        palm_frame: bool = True,
+    ):
+        self.encoder_def = encoder_def
+        self.encoder_params = encoder_params
+        self.normalize_scale = normalize_scale
+        self.embed_dim = encoder_def.output_dim
+        self._palm_frame_requested = palm_frame
+        self.frame = None  # set on first call
+
+    @classmethod
+    def load_checkpoint(cls, path: str) -> "ShardedRaycastConditioner":
+        """Restore a sharded raycast conditioner from the standard checkpoint.
+
+        The sharded and Gymnasium raycast paths share the same PointNet
+        parameter format.  Only the extraction backend differs.
+        """
+        base = OnlineRaycastConditioner.load_checkpoint(path)
+        return cls(
+            encoder_def=base.encoder_def,
+            encoder_params=base.encoder_params,
+            normalize_scale=base.normalize_scale,
+            palm_frame=True,
+        )
+
+    def extract_and_encode_sharded(self, env) -> np.ndarray:
+        """Extract raycast pointclouds from shards and encode.
+
+        Parameters
+        ----------
+        env : ShardedMjlabParallelEnv with enable_raycast_sensor=True
+
+        Returns
+        -------
+        embeddings : (num_slots, embed_dim) float32
+        """
+        rc = env.extract_raycast_pointclouds()
+        hit_pos = rc["hit_pos_w"]
+        normals = rc["normals_w"]
+        distances = rc["distances"]
+
+        mask = distances > 0.0
+
+        if self._palm_frame_requested:
+            try:
+                palm_pos, palm_quat = env.extract_palm_poses()
+                palm_rot = self._quat_to_rotmat(palm_quat)
+                points = self._to_palm_frame(hit_pos, palm_pos, palm_rot)
+                self.frame = "palm"
+            except (AttributeError, KeyError):
+                if self.frame is None:
+                    import sys
+                    print("WARNING: ShardedRaycastConditioner: palm body data "
+                          "unavailable, using world-frame pointclouds.", file=sys.stderr)
+                points = hit_pos.copy()
+                self.frame = "world"
+        else:
+            points = hit_pos.copy()
+            self.frame = "world"
+
+        points = np.where(mask[..., None], points, 0.0)
+        points = points / self.normalize_scale
+
+        embeddings = self.encoder_def.apply(
+            {"params": self.encoder_params},
+            jnp.array(points),
+            jnp.array(mask),
+        )
+        return np.asarray(embeddings)
+
+    @staticmethod
+    def _quat_to_rotmat(quat: np.ndarray) -> np.ndarray:
+        """Convert (N, 4) quaternion (w,x,y,z) to (N, 3, 3) rotation matrix."""
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        R = np.zeros((len(quat), 3, 3), dtype=np.float32)
+        R[:, 0, 0] = 1 - 2*(y*y + z*z)
+        R[:, 0, 1] = 2*(x*y - w*z)
+        R[:, 0, 2] = 2*(x*z + w*y)
+        R[:, 1, 0] = 2*(x*y + w*z)
+        R[:, 1, 1] = 1 - 2*(x*x + z*z)
+        R[:, 1, 2] = 2*(y*z - w*x)
+        R[:, 2, 0] = 2*(x*z - w*y)
+        R[:, 2, 1] = 2*(y*z + w*x)
+        R[:, 2, 2] = 1 - 2*(x*x + y*y)
+        return R
+
+    @staticmethod
+    def _to_palm_frame(
+        hit_pos: np.ndarray,
+        palm_pos: np.ndarray,
+        palm_rot: np.ndarray,
+    ) -> np.ndarray:
+        """Transform (N, R, 3) hit positions to palm frame."""
+        rel = hit_pos - palm_pos[:, None, :]
+        return np.einsum("nij,nrj->nri", palm_rot.transpose(0, 2, 1), rel)
+
+
+def build_sharded_raycast_conditioner(
+    seed: int = 0,
+    output_dim: int = DEFAULT_EMBED_DIM,
+    hidden_dims: tuple[int, ...] = DEFAULT_HIDDEN_DIMS,
+    n_points: int = 1024,
+    palm_frame: bool = True,
+) -> ShardedRaycastConditioner:
+    """Create a ShardedRaycastConditioner with random encoder parameters."""
+    encoder_def = MaskAwarePointNet(
+        hidden_dims=hidden_dims, output_dim=output_dim
+    )
+    rng = jax.random.PRNGKey(seed)
+    dummy_points = jnp.zeros((1, n_points, RAYCAST_POINT_CHANNELS))
+    dummy_mask = jnp.ones((1, n_points), dtype=bool)
+    variables = encoder_def.init(rng, dummy_points, dummy_mask)
+    encoder_params = variables["params"]
+
+    return ShardedRaycastConditioner(
+        encoder_def=encoder_def,
+        encoder_params=encoder_params,
+        palm_frame=palm_frame,
+    )

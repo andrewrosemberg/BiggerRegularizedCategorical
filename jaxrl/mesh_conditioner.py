@@ -426,6 +426,92 @@ def build_mesh_pose_conditioner(
     return MeshPoseConditioner(shape_features=features)
 
 
+def _quat_to_rot6d(quat: np.ndarray) -> np.ndarray:
+    """Convert quaternion (w,x,y,z) to 6D rotation (first two columns of R).
+
+    Parameters
+    ----------
+    quat : (..., 4)
+
+    Returns
+    -------
+    rot6d : (..., 6)
+    """
+    w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    col0 = np.stack([
+        1 - 2*(y*y + z*z),
+        2*(x*y + w*z),
+        2*(x*z - w*y),
+    ], axis=-1)
+    col1 = np.stack([
+        2*(x*y - w*z),
+        1 - 2*(x*x + z*z),
+        2*(y*z + w*x),
+    ], axis=-1)
+    return np.concatenate([col0, col1], axis=-1)
+
+
+class ShardedMeshPoseConditioner:
+    """Online conditioner for mesh_pose mode with ShardedMjlabParallelEnv.
+
+    Extracts object pose directly from mjlab shard scene data (privileged).
+    Combines static per-object shape features with per-step dynamic pose.
+
+    The embedding for slot s at step t is::
+
+        c_t = [z_m[obj_id[s]], p_t / pos_scale, rot6d(R_t)]
+
+    where p_t and R_t are the object pose in palm frame for slot s.
+    """
+
+    def __init__(
+        self,
+        shape_features: np.ndarray,
+        object_ids: np.ndarray,
+        pos_scale: float = 0.34,
+    ):
+        self.shape_features = shape_features.astype(np.float32)
+        self.object_ids = object_ids
+        self.pos_scale = pos_scale
+        self.embed_dim = shape_features.shape[1] + POSE_DIM
+        self._palm_available = None
+
+    def extract_and_encode_sharded(self, env) -> np.ndarray:
+        """Compute per-slot mesh-pose embeddings from a sharded mjlab env.
+
+        Parameters
+        ----------
+        env : ShardedMjlabParallelEnv
+
+        Returns
+        -------
+        embeddings : (num_slots, embed_dim) float32
+        """
+        obj_poses = env.extract_object_poses()
+        obj_pos = obj_poses[:, :3]
+        obj_quat = obj_poses[:, 3:]
+
+        try:
+            palm_pos, palm_quat = env.extract_palm_poses()
+            self._palm_available = True
+        except (AttributeError, KeyError):
+            if self._palm_available is None:
+                import sys
+                print("WARNING: ShardedMeshPoseConditioner: palm body data unavailable, "
+                      "using world-frame pose (not palm-relative).", file=sys.stderr)
+            self._palm_available = False
+            palm_pos = np.zeros_like(obj_pos)
+            palm_quat = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (len(obj_pos), 1))
+
+        pos_rel = obj_pos - palm_pos
+        pos_scaled = pos_rel / self.pos_scale
+        rot6d = _quat_to_rot6d(obj_quat)
+
+        shape_feats = self.shape_features[self.object_ids]
+        embeddings = np.concatenate([shape_feats, pos_scaled, rot6d], axis=-1)
+        return embeddings.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Mesh encoder checkpoint save/load
 # ---------------------------------------------------------------------------

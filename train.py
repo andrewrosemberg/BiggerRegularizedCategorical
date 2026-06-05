@@ -7,10 +7,10 @@ import numpy as np
 from absl import app, flags
 
 from jaxrl.agent.brc_learner import BRC
-from jaxrl.replay_buffer import ParallelReplayBuffer
+from jaxrl.replay_buffer import ParallelReplayBuffer, ObjectAwareReplayBuffer
 from jaxrl.envs import ParallelEnv
-from jaxrl.normalizer import RewardNormalizer
-from jaxrl.logger import EpisodeRecorder
+from jaxrl.normalizer import RewardNormalizer, ObjectAwareRewardNormalizer
+from jaxrl.logger import EpisodeRecorder, ObjectAwareEpisodeRecorder
 from jaxrl.env_names import get_environment_list
 
 FLAGS = flags.FLAGS
@@ -63,9 +63,16 @@ def main(_):
         
     env_names = get_environment_list(FLAGS.env_names)
 
-    if FLAGS.env_backend in ('mjlab', 'mjlab_sharded'):
-        if FLAGS.conditioning_mode != 'none':
-            print(f"Error: {FLAGS.env_backend} backend requires --conditioning_mode=none; got {FLAGS.conditioning_mode}", file=sys.stderr)
+    _MJLAB_SUPPORTED_MODES = {
+        'mjlab': {'none'},
+        'mjlab_sharded': {'none', 'mesh_shape', 'mesh_pose', 'wrist_raycast'},
+    }
+    if FLAGS.env_backend in _MJLAB_SUPPORTED_MODES:
+        supported_modes = _MJLAB_SUPPORTED_MODES[FLAGS.env_backend]
+        if FLAGS.conditioning_mode not in supported_modes:
+            print(f"Error: {FLAGS.env_backend} backend supports conditioning_mode in "
+                  f"{sorted(supported_modes)}; got {FLAGS.conditioning_mode!r}",
+                  file=sys.stderr)
             sys.exit(1)
         if FLAGS.offline_evaluation:
             print(f"Warning: {FLAGS.env_backend} backend does not support offline evaluation; forcing --offline_evaluation=False", file=sys.stderr)
@@ -75,7 +82,11 @@ def main(_):
             FLAGS.render = False
         if FLAGS.env_backend == 'mjlab_sharded':
             from jaxrl.mjlab_sharded_envs import ShardedMjlabParallelEnv
-            env = ShardedMjlabParallelEnv(env_names, seed=FLAGS.seed, num_envs=FLAGS.mjlab_num_envs)
+            _enable_raycast = (FLAGS.conditioning_mode == 'wrist_raycast')
+            env = ShardedMjlabParallelEnv(
+                env_names, seed=FLAGS.seed, num_envs=FLAGS.mjlab_num_envs,
+                enable_raycast_sensor=_enable_raycast,
+            )
         else:
             from jaxrl.mjlab_envs import MjlabParallelEnv
             env = MjlabParallelEnv(env_names, seed=FLAGS.seed, num_envs=FLAGS.mjlab_num_envs)
@@ -96,9 +107,21 @@ def main(_):
     kwargs['width_critic'] = FLAGS.width_critic
     kwargs['conditioning_mode'] = FLAGS.conditioning_mode
 
-    num_tasks = len(env.envs)
+    _use_object_aware = (FLAGS.env_backend == 'mjlab_sharded')
+    if _use_object_aware:
+        num_tasks = env.num_objects
+        _num_slots = env.num_tasks
+        _object_ids = env.object_ids
+    else:
+        num_tasks = len(env.envs)
 
     online_conditioner = None
+    sharded_online_conditioner = None
+
+    # Object names for conditioner: use unique objects for sharded, env_names otherwise
+    _conditioner_object_names = (
+        list(env.unique_object_names) if _use_object_aware else env_names
+    )
 
     if FLAGS.conditioning_mode == 'mesh_shape':
         import dex_envs
@@ -106,7 +129,7 @@ def main(_):
         if FLAGS.mesh_encoder_checkpoint:
             from jaxrl.mesh_conditioner import build_learned_mesh_features
             conditioner_features, conditioner_meta = build_learned_mesh_features(
-                env_names, assets_dir, FLAGS.mesh_encoder_checkpoint, seed=FLAGS.seed,
+                _conditioner_object_names, assets_dir, FLAGS.mesh_encoder_checkpoint, seed=FLAGS.seed,
             )
             print(f"Loaded mesh encoder from {FLAGS.mesh_encoder_checkpoint} "
                   f"(feature_dim={conditioner_features.shape[1]})")
@@ -118,7 +141,7 @@ def main(_):
                 sys.exit(1)
             from jaxrl.mesh_conditioner import build_conditioner_features_from_manifest
             conditioner_features, conditioner_meta = build_conditioner_features_from_manifest(
-                env_names, assets_dir, FLAGS.split_manifest,
+                _conditioner_object_names, assets_dir, FLAGS.split_manifest,
             )
             print("WARNING: mesh_shape uses deterministic 8D descriptors (no learned encoder). "
                   "Use --mesh_encoder_checkpoint to load a trained PointNet.",
@@ -126,54 +149,94 @@ def main(_):
         kwargs['conditioner_features'] = conditioner_features
 
     elif FLAGS.conditioning_mode == 'wrist_raycast':
-        if FLAGS.conditioner_checkpoint:
-            from jaxrl.online_conditioner import OnlineRaycastConditioner
-            online_conditioner = OnlineRaycastConditioner.load_checkpoint(
-                FLAGS.conditioner_checkpoint,
-            )
-            print(f"Loaded raycast conditioner from {FLAGS.conditioner_checkpoint} "
-                  f"(embed_dim={online_conditioner.embed_dim})")
+        if _use_object_aware:
+            from jaxrl.online_conditioner import build_sharded_raycast_conditioner
+            from jaxrl.mjlab_shadowhand import RAYCAST_GRID_W, RAYCAST_GRID_H
+            n_rays = RAYCAST_GRID_W * RAYCAST_GRID_H
+            if FLAGS.conditioner_checkpoint:
+                from jaxrl.online_conditioner import ShardedRaycastConditioner
+                sharded_online_conditioner = ShardedRaycastConditioner.load_checkpoint(
+                    FLAGS.conditioner_checkpoint,
+                )
+            else:
+                sharded_online_conditioner = build_sharded_raycast_conditioner(
+                    seed=FLAGS.seed, output_dim=FLAGS.conditioner_embed_dim,
+                    n_points=n_rays,
+                )
+            print(f"wrist_raycast (sharded, mjlab sensor): embed_dim={sharded_online_conditioner.embed_dim}, "
+                  f"rays={n_rays}, sensor-only (no privileged info)")
         else:
-            from jaxrl.online_conditioner import build_raycast_conditioner
-            online_conditioner = build_raycast_conditioner(
-                seed=FLAGS.seed, output_dim=FLAGS.conditioner_embed_dim,
-            )
-            print("WARNING: wrist_raycast conditioner is UNTRAINED (random parameters). "
-                  "Use --conditioner_checkpoint to load a trained encoder.",
-                  file=sys.stderr)
+            if FLAGS.conditioner_checkpoint:
+                from jaxrl.online_conditioner import OnlineRaycastConditioner
+                online_conditioner = OnlineRaycastConditioner.load_checkpoint(
+                    FLAGS.conditioner_checkpoint,
+                )
+                print(f"Loaded raycast conditioner from {FLAGS.conditioner_checkpoint} "
+                      f"(embed_dim={online_conditioner.embed_dim})")
+            else:
+                from jaxrl.online_conditioner import build_raycast_conditioner
+                online_conditioner = build_raycast_conditioner(
+                    seed=FLAGS.seed, output_dim=FLAGS.conditioner_embed_dim,
+                )
+                print("WARNING: wrist_raycast conditioner is UNTRAINED (random parameters). "
+                      "Use --conditioner_checkpoint to load a trained encoder.",
+                      file=sys.stderr)
 
     elif FLAGS.conditioning_mode == 'mesh_pose':
         import dex_envs
-        from jaxrl.mesh_conditioner import MeshPoseConditioner
         assets_dir = os.path.join(os.path.dirname(dex_envs.__file__), 'assets')
-        if FLAGS.mesh_encoder_checkpoint:
-            from jaxrl.mesh_conditioner import build_learned_mesh_features
-            shape_features, mesh_meta = build_learned_mesh_features(
-                env_names, assets_dir, FLAGS.mesh_encoder_checkpoint, seed=FLAGS.seed,
+        if _use_object_aware:
+            from jaxrl.mesh_conditioner import ShardedMeshPoseConditioner
+            if FLAGS.mesh_encoder_checkpoint:
+                from jaxrl.mesh_conditioner import build_learned_mesh_features
+                shape_features, mesh_meta = build_learned_mesh_features(
+                    _conditioner_object_names, assets_dir, FLAGS.mesh_encoder_checkpoint, seed=FLAGS.seed,
+                )
+            else:
+                if not FLAGS.split_manifest:
+                    print("Error: --split_manifest is required when conditioning_mode=mesh_pose "
+                          "and no --mesh_encoder_checkpoint is provided",
+                          file=sys.stderr)
+                    sys.exit(1)
+                from jaxrl.mesh_conditioner import build_conditioner_features_from_manifest
+                shape_features, mesh_meta = build_conditioner_features_from_manifest(
+                    _conditioner_object_names, assets_dir, FLAGS.split_manifest,
+                )
+            sharded_online_conditioner = ShardedMeshPoseConditioner(
+                shape_features=shape_features, object_ids=_object_ids,
             )
-            online_conditioner = MeshPoseConditioner(shape_features=shape_features)
-            print(f"Loaded mesh encoder from {FLAGS.mesh_encoder_checkpoint} "
-                  f"(shape_dim={shape_features.shape[1]}, total_embed_dim={online_conditioner.embed_dim})")
+            print(f"mesh_pose (sharded, PRIVILEGED): shape_dim={shape_features.shape[1]}, "
+                  f"total_embed_dim={sharded_online_conditioner.embed_dim}")
         else:
-            if not FLAGS.split_manifest:
-                print("Error: --split_manifest is required when conditioning_mode=mesh_pose "
-                      "and no --mesh_encoder_checkpoint is provided",
+            from jaxrl.mesh_conditioner import MeshPoseConditioner
+            if FLAGS.mesh_encoder_checkpoint:
+                from jaxrl.mesh_conditioner import build_learned_mesh_features
+                shape_features, mesh_meta = build_learned_mesh_features(
+                    _conditioner_object_names, assets_dir, FLAGS.mesh_encoder_checkpoint, seed=FLAGS.seed,
+                )
+                online_conditioner = MeshPoseConditioner(shape_features=shape_features)
+                print(f"Loaded mesh encoder from {FLAGS.mesh_encoder_checkpoint} "
+                      f"(shape_dim={shape_features.shape[1]}, total_embed_dim={online_conditioner.embed_dim})")
+            else:
+                if not FLAGS.split_manifest:
+                    print("Error: --split_manifest is required when conditioning_mode=mesh_pose "
+                          "and no --mesh_encoder_checkpoint is provided",
+                          file=sys.stderr)
+                    sys.exit(1)
+                from jaxrl.mesh_conditioner import build_mesh_pose_conditioner
+                online_conditioner = build_mesh_pose_conditioner(
+                    _conditioner_object_names, assets_dir, FLAGS.split_manifest,
+                    seed=FLAGS.seed, embed_dim=FLAGS.conditioner_embed_dim,
+                )
+                print("WARNING: mesh_pose uses deterministic 8D shape descriptors (no learned encoder). "
+                      "Use --mesh_encoder_checkpoint to load a trained PointNet.",
                       file=sys.stderr)
-                sys.exit(1)
-            from jaxrl.mesh_conditioner import build_mesh_pose_conditioner
-            online_conditioner = build_mesh_pose_conditioner(
-                env_names, assets_dir, FLAGS.split_manifest,
-                seed=FLAGS.seed, embed_dim=FLAGS.conditioner_embed_dim,
-            )
-            print("WARNING: mesh_pose uses deterministic 8D shape descriptors (no learned encoder). "
-                  "Use --mesh_encoder_checkpoint to load a trained PointNet.",
-                  file=sys.stderr)
 
+    _active_online_cond = online_conditioner or sharded_online_conditioner
     obs_sample = env.observation_space.sample()[:1]
-    if online_conditioner is not None:
-        import numpy as _np
-        obs_sample = _np.concatenate(
-            [obs_sample, _np.zeros((1, online_conditioner.embed_dim), dtype=_np.float32)],
+    if _active_online_cond is not None:
+        obs_sample = np.concatenate(
+            [obs_sample, np.zeros((1, _active_online_cond.embed_dim), dtype=np.float32)],
             axis=-1,
         )
 
@@ -184,10 +247,38 @@ def main(_):
         num_tasks=num_tasks,
         **kwargs,
     )
-    
+
     batch_size = 1024 if num_tasks > 1 else 256
 
-    if online_conditioner is not None:
+    import jax.numpy as jnp
+    _slot_task_ids = jnp.array(_object_ids, dtype=jnp.int32) if _use_object_aware else None
+
+    if _use_object_aware:
+        if sharded_online_conditioner is not None:
+            aug_dim = env.observation_space.shape[-1] + sharded_online_conditioner.embed_dim
+            from jaxrl.mjlab_sharded_envs import _FakeGymSpace
+            aug_obs_space = _FakeGymSpace(
+                low=np.full((_num_slots, aug_dim), -np.inf, dtype=np.float32),
+                high=np.full((_num_slots, aug_dim), np.inf, dtype=np.float32),
+                shape=(_num_slots, aug_dim), dtype=np.float32,
+            )
+            replay_buffer = ObjectAwareReplayBuffer(
+                aug_obs_space, env.action_space.shape[-1],
+                FLAGS.replay_buffer_size, num_objects=num_tasks,
+                slot_to_object=_object_ids,
+            )
+        else:
+            replay_buffer = ObjectAwareReplayBuffer(
+                env.observation_space, env.action_space.shape[-1],
+                FLAGS.replay_buffer_size, num_objects=num_tasks,
+                slot_to_object=_object_ids,
+            )
+        reward_normalizer = ObjectAwareRewardNormalizer(
+            num_tasks, _num_slots, _object_ids,
+            target_entropy=agent.target_entropy, discount=agent.discount,
+        )
+        statistics_recorder = ObjectAwareEpisodeRecorder(num_tasks, _num_slots, _object_ids)
+    elif online_conditioner is not None:
         import gymnasium as _gym
         aug_dim = env.observation_space.shape[-1] + online_conditioner.embed_dim
         aug_obs_space = _gym.spaces.Box(
@@ -195,18 +286,21 @@ def main(_):
             shape=(num_tasks, aug_dim), dtype=np.float32,
         )
         replay_buffer = ParallelReplayBuffer(aug_obs_space, env.action_space.shape[-1], FLAGS.replay_buffer_size, num_tasks=num_tasks)
+        reward_normalizer = RewardNormalizer(num_tasks, target_entropy=agent.target_entropy, discount=agent.discount)
+        statistics_recorder = EpisodeRecorder(num_tasks)
     else:
         replay_buffer = ParallelReplayBuffer(env.observation_space, env.action_space.shape[-1], FLAGS.replay_buffer_size, num_tasks=num_tasks)
-
-    reward_normalizer = RewardNormalizer(num_tasks, target_entropy=agent.target_entropy, discount=agent.discount)
-
-    statistics_recorder = EpisodeRecorder(num_tasks)
+        reward_normalizer = RewardNormalizer(num_tasks, target_entropy=agent.target_entropy, discount=agent.discount)
+        statistics_recorder = EpisodeRecorder(num_tasks)
 
     def _augment_obs(raw_obs):
-        if online_conditioner is None:
-            return raw_obs
-        embeddings = online_conditioner.extract_and_encode(env.envs)
-        return np.concatenate([raw_obs, embeddings], axis=-1)
+        if sharded_online_conditioner is not None:
+            embeddings = sharded_online_conditioner.extract_and_encode_sharded(env)
+            return np.concatenate([raw_obs, embeddings], axis=-1)
+        if online_conditioner is not None:
+            embeddings = online_conditioner.extract_and_encode(env.envs)
+            return np.concatenate([raw_obs, embeddings], axis=-1)
+        return raw_obs
 
     def _eval_augment_obs(raw_obs, envs):
         if online_conditioner is None:
@@ -217,7 +311,10 @@ def main(_):
     observations = _augment_obs(env.reset())
 
     for i in range(1, FLAGS.max_steps + 1):
-        actions = env.action_space.sample() if i < FLAGS.start_training else agent.sample_actions(observations, temperature=1.0)
+        if i < FLAGS.start_training:
+            actions = env.action_space.sample()
+        else:
+            actions = agent.sample_actions(observations, temperature=1.0, task_ids=_slot_task_ids)
         next_raw_obs, rewards, terms, truns, goals = env.step(actions)
         next_observations = _augment_obs(next_raw_obs)
         reward_normalizer.update(rewards, terms, truns)
@@ -232,7 +329,7 @@ def main(_):
             batches = replay_buffer.sample(batch_size, FLAGS.updates_per_step)
             batches = reward_normalizer.normalize(batches, agent.get_temperature())
             _ = agent.update(batches, FLAGS.updates_per_step, i)
-            if i % eval_interval == 0 and i >= FLAGS.start_training:  
+            if i % eval_interval == 0 and i >= FLAGS.start_training:
                 info_dict = statistics_recorder.log(FLAGS, agent, replay_buffer, reward_normalizer, i, eval_env, render=FLAGS.render, obs_augment_fn=_eval_augment_obs if online_conditioner is not None else None)
                 eval_summary = {k: info_dict[k] for k in ('goal', 'return', 'goal_online', 'return_online') if k in info_dict}
                 print(f"step={i} {eval_summary}")

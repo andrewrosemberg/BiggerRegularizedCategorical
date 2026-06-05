@@ -25,6 +25,7 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
+from mjlab.sensor import ObjRef, PinholeCameraPatternCfg, RayCastSensorCfg
 from mjlab.terrains import TerrainEntityCfg
 
 
@@ -564,3 +565,81 @@ def build_shadowhand_multiobject_env_cfg(
     )
     cfg.scene.spec_fn = _make_asset_patcher(object_names, "object")
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Wrist raycast sensor injection for mjlab_sharded
+# ---------------------------------------------------------------------------
+
+RAYCAST_SENSOR_NAME = "pointnet_raycast"
+RAYCAST_SITE_NAME = "pointnet_camera_site"
+RAYCAST_PARENT_BODY = "robot0:palm"
+RAYCAST_SITE_POS = (0.0024, -0.2019, -0.0613)
+RAYCAST_SITE_QUAT = (0.466397, 0.884213, 0.016008, -0.019628)
+RAYCAST_GRID_W = 32
+RAYCAST_GRID_H = 32
+RAYCAST_FOVY = 40.0
+RAYCAST_MAX_DISTANCE = 0.34
+
+
+def augment_cfg_with_raycast_sensor(
+    cfg: ManagerBasedRlEnvCfg,
+    *,
+    sensor_name: str = RAYCAST_SENSOR_NAME,
+    site_name: str = RAYCAST_SITE_NAME,
+    parent_body: str = RAYCAST_PARENT_BODY,
+    site_pos: tuple[float, ...] = RAYCAST_SITE_POS,
+    site_quat: tuple[float, ...] = RAYCAST_SITE_QUAT,
+    grid_w: int = RAYCAST_GRID_W,
+    grid_h: int = RAYCAST_GRID_H,
+    fovy: float = RAYCAST_FOVY,
+    max_distance: float = RAYCAST_MAX_DISTANCE,
+    exclude_parent_body: bool = True,
+) -> None:
+    """Inject a wrist-mounted raycast sensor into an mjlab env config.
+
+    Uses mjlab's GPU-native ``RayCastSensorCfg`` — no CPU ``mj_ray``.
+    The site is created on the ShadowHand palm body via ``spec_fn`` if it
+    does not already exist in the XML.
+    """
+    site_prefixed = f"robot/{site_name}"
+    parent_prefixed = f"robot/{parent_body}"
+
+    previous_spec_fn = cfg.scene.spec_fn
+
+    def _ensure_camera_site(scene_spec: mujoco.MjSpec) -> None:
+        if previous_spec_fn is not None:
+            previous_spec_fn(scene_spec)
+        if scene_spec.site(site_prefixed) is not None:
+            return
+        body = scene_spec.body(parent_prefixed)
+        if body is None:
+            raise ValueError(
+                f"Raycast parent body '{parent_prefixed}' not found in scene spec. "
+                f"Available bodies: {[b.name for b in scene_spec.bodies]}"
+            )
+        body.add_site(
+            name=site_prefixed,
+            pos=site_pos,
+            quat=site_quat,
+            size=(0.002,),
+        )
+
+    cfg.scene.spec_fn = _ensure_camera_site
+
+    sensors = list(cfg.scene.sensors or ())
+    sensors = [s for s in sensors if getattr(s, "name", None) != sensor_name]
+    sensors.append(
+        RayCastSensorCfg(
+            name=sensor_name,
+            frame=ObjRef(type="site", name=site_prefixed),
+            pattern=PinholeCameraPatternCfg(
+                width=grid_w,
+                height=grid_h,
+                fovy=fovy,
+            ),
+            max_distance=max_distance,
+            exclude_parent_body=exclude_parent_body,
+        )
+    )
+    cfg.scene.sensors = tuple(sensors)

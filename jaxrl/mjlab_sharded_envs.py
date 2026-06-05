@@ -62,6 +62,8 @@ class ShardedMjlabParallelEnv:
         *,
         num_envs: int | None = None,
         device: str | None = None,
+        enable_raycast_sensor: bool = False,
+        raycast_sensor_name: str = "pointnet_raycast",
     ):
         if device is None:
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -94,6 +96,7 @@ class ShardedMjlabParallelEnv:
         self.unique_object_names = tuple(unique_objects)
         self.num_objects = num_objects
         self._device = device
+        self._raycast_sensor_name = raycast_sensor_name if enable_raycast_sensor else None
         self._shards: list[ManagerBasedRlEnv] = []
         self._shard_sizes: list[int] = []
         self._shard_obj_entity_names: list[str] = []
@@ -118,6 +121,10 @@ class ShardedMjlabParallelEnv:
                     variant_assignment=[0] * shard_size,
                 )
                 entity_name = "object"
+
+            if enable_raycast_sensor:
+                from jaxrl.mjlab_shadowhand import augment_cfg_with_raycast_sensor
+                augment_cfg_with_raycast_sensor(cfg, sensor_name=raycast_sensor_name)
 
             env = ManagerBasedRlEnv(cfg, device=device)
             self._shards.append(env)
@@ -246,6 +253,106 @@ class ShardedMjlabParallelEnv:
                 truncates[global_idx] = False
 
         return states, terminals, truncates
+
+    def extract_object_poses(self) -> np.ndarray:
+        """Extract object (pos, quat) in world frame for every slot.
+
+        Returns
+        -------
+        poses : (num_slots, 7) float32
+            Columns 0-2: object position, 3-6: object quaternion (w,x,y,z).
+        """
+        total_envs = self.num_tasks
+        poses = np.empty((total_envs, 7), dtype=np.float32)
+        for i, env in enumerate(self._shards):
+            offset = self._shard_offsets[i]
+            sz = self._shard_sizes[i]
+            entity_name = self._shard_obj_entity_names[i]
+            pos = env.scene[entity_name].data.root_link_pos_w.cpu().numpy()
+            quat = env.scene[entity_name].data.root_link_quat_w.cpu().numpy()
+            poses[offset:offset + sz, :3] = pos[:sz].astype(np.float32)
+            poses[offset:offset + sz, 3:] = quat[:sz].astype(np.float32)
+        return poses
+
+    def extract_palm_poses(self) -> np.ndarray:
+        """Extract palm body (pos, rot_matrix) in world frame for every slot.
+
+        Requires the robot entity to expose body-level state via
+        ``scene["robot"].data.body_link_pos_w`` and ``body_link_quat_w``.
+
+        Returns
+        -------
+        palm_pos : (num_slots, 3) float32
+        palm_quat : (num_slots, 4) float32  — (w,x,y,z)
+
+        Raises
+        ------
+        AttributeError
+            If the mjlab entity API does not expose per-body state.
+        """
+        total_envs = self.num_tasks
+        palm_pos = np.empty((total_envs, 3), dtype=np.float32)
+        palm_quat = np.empty((total_envs, 4), dtype=np.float32)
+        for i, env in enumerate(self._shards):
+            offset = self._shard_offsets[i]
+            sz = self._shard_sizes[i]
+            robot_data = env.scene["robot"].data
+            bp = robot_data.body_link_pos_w.cpu().numpy()
+            bq = robot_data.body_link_quat_w.cpu().numpy()
+            palm_idx = self._palm_body_index(env)
+            palm_pos[offset:offset + sz] = bp[:sz, palm_idx].astype(np.float32)
+            palm_quat[offset:offset + sz] = bq[:sz, palm_idx].astype(np.float32)
+        return palm_pos, palm_quat
+
+    @staticmethod
+    def _palm_body_index(env) -> int:
+        """Find the index of robot0:palm within the robot articulation."""
+        body_names = env.scene["robot"].body_names
+        for idx, name in enumerate(body_names):
+            if "palm" in name.lower():
+                return idx
+        return 0
+
+    def extract_raycast_pointclouds(self) -> dict[str, np.ndarray]:
+        """Read GPU raycast sensor data from all shards.
+
+        Requires ``enable_raycast_sensor=True`` at construction time.
+
+        Returns
+        -------
+        dict with keys:
+            ``hit_pos_w``  : (num_slots, num_rays, 3) float32
+            ``normals_w``  : (num_slots, num_rays, 3) float32
+            ``distances``  : (num_slots, num_rays)    float32
+        """
+        if self._raycast_sensor_name is None:
+            raise RuntimeError(
+                "Raycast sensor not enabled. Construct with enable_raycast_sensor=True."
+            )
+        sensor_name = self._raycast_sensor_name
+        total_envs = self.num_tasks
+
+        first_sensor = self._shards[0].scene[sensor_name]
+        num_rays = first_sensor.data.hit_pos_w.shape[1]
+
+        hit_pos = np.empty((total_envs, num_rays, 3), dtype=np.float32)
+        normals = np.empty((total_envs, num_rays, 3), dtype=np.float32)
+        distances = np.empty((total_envs, num_rays), dtype=np.float32)
+
+        for i, env in enumerate(self._shards):
+            offset = self._shard_offsets[i]
+            sz = self._shard_sizes[i]
+            sd = env.scene[sensor_name].data
+            hit_pos[offset:offset + sz] = sd.hit_pos_w[:sz].cpu().numpy().astype(np.float32)
+            normals[offset:offset + sz] = sd.normals_w[:sz].cpu().numpy().astype(np.float32)
+            distances[offset:offset + sz] = sd.distances[:sz].cpu().numpy().astype(np.float32)
+
+        return {
+            "hit_pos_w": hit_pos,
+            "normals_w": normals,
+            "distances": distances,
+            "num_rays": num_rays,
+        }
 
     def close(self):
         for env in self._shards:

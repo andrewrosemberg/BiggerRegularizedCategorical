@@ -60,4 +60,64 @@ class EpisodeRecorder:
         if FLAGS.log_to_wandb:
             log_to_wandb(step, infos)
         return infos
-    
+
+
+class ObjectAwareEpisodeRecorder:
+    """Episode recorder that tracks per-slot episodes but reports per-object metrics."""
+
+    def __init__(self, num_objects: int, num_slots: int, slot_to_object: np.ndarray):
+        self.num_objects = num_objects
+        self._num_slots = num_slots
+        self._slot_to_object = np.asarray(slot_to_object, dtype=np.int32)
+        self.returns_online_episode = np.zeros(num_slots)
+        self.goals_online_episode = np.zeros(num_slots)
+        self.returns_online = np.zeros(num_objects)
+        self.goals_online = np.zeros(num_objects)
+        self.counts = np.zeros(num_objects)
+        self.num_seeds = num_objects
+
+    def update(self, rewards: np.ndarray, goals: np.ndarray,
+               terminals: np.ndarray, truncates: np.ndarray):
+        self.returns_online_episode += rewards
+        self.goals_online_episode += goals
+        done = np.logical_or(terminals, truncates)
+        if done.any():
+            self.goals_online_episode[self.goals_online_episode > 0.0] = 1.0
+            for j in done.nonzero()[0]:
+                obj_id = self._slot_to_object[j]
+                self.counts[obj_id] += 1
+                self.goals_online[obj_id] += self.goals_online_episode[j]
+                self.returns_online[obj_id] += self.returns_online_episode[j]
+            self.returns_online_episode = np.where(done, 0, self.returns_online_episode)
+            self.goals_online_episode = np.where(done, 0, self.goals_online_episode)
+
+    def _get_scores(self):
+        counts = np.where(self.counts == 0.0, 1e-8, self.counts)
+        infos = {
+            'goal_online': self.goals_online / counts,
+            'return_online': self.returns_online / counts,
+        }
+        self.returns_online = np.zeros(self.num_objects)
+        self.goals_online = np.zeros(self.num_objects)
+        self.counts = np.zeros(self.num_objects)
+        print(infos)
+        return infos
+
+    def log(self, FLAGS, agent, replay_buffer, reward_normalizer, step,
+            eval_env=None, render=False, obs_augment_fn=None):
+        batches_info = replay_buffer.sample_task_batches()
+        batches_info = reward_normalizer.normalize(batches_info, agent.get_temperature())
+        infos = agent.get_infos(batches_info)
+        infos_online_eval = self._get_scores()
+        infos = {**infos, **infos_online_eval}
+        if FLAGS.offline_evaluation:
+            eval_stats = eval_env.evaluate(
+                agent, num_episodes=FLAGS.eval_episodes, temperature=0.0,
+                render=render, obs_augment_fn=obs_augment_fn,
+            )
+            if render:
+                eval_stats['renders'] = get_wandb_video(eval_stats['renders'])
+            infos = {**infos, **eval_stats}
+        if FLAGS.log_to_wandb:
+            log_to_wandb(step, infos)
+        return infos
