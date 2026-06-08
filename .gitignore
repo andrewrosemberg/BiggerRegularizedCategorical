@@ -6,3 +6,4 @@ agent_reports/
 __pycache__/
 checkpoints/
 .claude/
+*.out
