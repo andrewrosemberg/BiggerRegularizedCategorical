@@ -42,6 +42,10 @@ flags.DEFINE_string('env_backend', 'gymnasium',
                     'Environment backend: gymnasium | mjlab | mjlab_sharded.')
 flags.DEFINE_integer('mjlab_num_envs', 64,
                      'Number of parallel environment slots for mjlab backends.')
+flags.DEFINE_string('checkpoint_dir', None,
+                    'Directory for saving/resuming checkpoints. If None, no checkpointing.')
+flags.DEFINE_integer('checkpoint_interval', 1000,
+                     'Save a checkpoint every N training steps.')
 
 _VALID_BACKENDS = {'gymnasium', 'mjlab', 'mjlab_sharded'}
 
@@ -253,6 +257,20 @@ def main(_):
     import jax.numpy as jnp
     _slot_task_ids = jnp.array(_object_ids, dtype=jnp.int32) if _use_object_aware else None
 
+    _start_step = 1
+    if FLAGS.checkpoint_dir:
+        _ckpt_step_file = os.path.join(FLAGS.checkpoint_dir, 'step.txt')
+        if os.path.exists(_ckpt_step_file):
+            with open(_ckpt_step_file) as f:
+                _start_step = int(f.read().strip()) + 1
+            agent.load(FLAGS.checkpoint_dir)
+            if sharded_online_conditioner is not None and hasattr(sharded_online_conditioner, 'save_checkpoint'):
+                _cond_ckpt = os.path.join(FLAGS.checkpoint_dir, 'conditioner')
+                if os.path.exists(_cond_ckpt):
+                    from jaxrl.online_conditioner import ShardedRaycastConditioner
+                    sharded_online_conditioner = ShardedRaycastConditioner.load_checkpoint(_cond_ckpt)
+            print(f"Resumed from checkpoint at step {_start_step - 1}")
+
     if _use_object_aware:
         if sharded_online_conditioner is not None:
             aug_dim = env.observation_space.shape[-1] + sharded_online_conditioner.embed_dim
@@ -310,7 +328,7 @@ def main(_):
 
     observations = _augment_obs(env.reset())
 
-    for i in range(1, FLAGS.max_steps + 1):
+    for i in range(_start_step, FLAGS.max_steps + 1):
         if i < FLAGS.start_training:
             actions = env.action_space.sample()
         else:
@@ -333,6 +351,14 @@ def main(_):
                 info_dict = statistics_recorder.log(FLAGS, agent, replay_buffer, reward_normalizer, i, eval_env, render=FLAGS.render, obs_augment_fn=_eval_augment_obs if online_conditioner is not None else None)
                 eval_summary = {k: info_dict[k] for k in ('goal', 'return', 'goal_online', 'return_online') if k in info_dict}
                 print(f"step={i} {eval_summary}")
+            if FLAGS.checkpoint_dir and i % FLAGS.checkpoint_interval == 0:
+                os.makedirs(FLAGS.checkpoint_dir, exist_ok=True)
+                agent.save(FLAGS.checkpoint_dir)
+                if sharded_online_conditioner is not None and hasattr(sharded_online_conditioner, 'save_checkpoint'):
+                    sharded_online_conditioner.save_checkpoint(os.path.join(FLAGS.checkpoint_dir, 'conditioner'))
+                with open(os.path.join(FLAGS.checkpoint_dir, 'step.txt'), 'w') as f:
+                    f.write(str(i))
+                print(f"Checkpoint saved at step {i}")
 
 
 if __name__ == '__main__':
