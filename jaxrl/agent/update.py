@@ -5,6 +5,14 @@ from jaxrl.utils import Batch, Model, Params, PRNGKey, tree_norm
 
 @functools.partial(jax.jit, static_argnames=('multitask'))
 def build_actor_input(critic: Model, observations: jnp.ndarray, task_ids: jnp.ndarray, multitask: bool):
+    """Build actor inputs for the categorical task-embedding path.
+
+    ``multitask`` is the historical flag used by the original BRC code to mean
+    "append a learned categorical task embedding from the critic". Geometry
+    conditioning modes set this flag to False even when training on multiple
+    objects. Their geometry vectors are already part of ``observations`` before
+    this function is called.
+    """
     inputs = observations
     if multitask:
         task_embeddings = critic(None, None, task_ids, True)

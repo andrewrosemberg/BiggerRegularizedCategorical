@@ -1,0 +1,34 @@
+{
+  "seed": 20260520,
+  "settings": [
+    {
+      "label": "baseline_16x16_fov60",
+      "grid": 16,
+      "fov": 60.0
+    },
+    {
+      "label": "default_32x32_fov40",
+      "grid": 32,
+      "fov": 40.0
+    },
+    {
+      "label": "hq_64x64_fov40",
+      "grid": 64,
+      "fov": 40.0
+    }
+  ],
+  "objects": [
+    "mug",
+    "hammer",
+    "knife",
+    "cracker_box",
+    "wine_glass"
+  ],
+  "figure_paths": [
+    "docs/raycast_sensor_sweep/figures/mug_setting_comparison.png",
+    "docs/raycast_sensor_sweep/figures/hammer_setting_comparison.png",
+    "docs/raycast_sensor_sweep/figures/knife_setting_comparison.png",
+    "docs/raycast_sensor_sweep/figures/cracker_box_setting_comparison.png",
+    "docs/raycast_sensor_sweep/figures/wine_glass_setting_comparison.png"
+  ]
+}

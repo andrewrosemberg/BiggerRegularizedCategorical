@@ -66,4 +66,55 @@ class RewardNormalizer(object):
         denominator = denominator[batches.task_ids]
         rewards = batches.rewards / denominator
         return Batch(observations=batches.observations, actions=batches.actions, rewards=rewards, masks=batches.masks, next_observations=batches.next_observations, task_ids=batches.task_ids)
-   
+
+
+class ObjectAwareRewardNormalizer:
+    """Reward normalizer that tracks per-slot episodes but aggregates by object."""
+
+    def __init__(self, num_objects: int, num_slots: int, slot_to_object: np.ndarray,
+                 target_entropy: float, discount: float = 0.99, v_max: float = 10.0):
+        self._num_objects = num_objects
+        self._num_slots = num_slots
+        self._slot_to_object = np.asarray(slot_to_object, dtype=np.int32)
+        self.returns_min_norm = np.full(num_objects, np.inf, dtype=np.float32)
+        self.returns_max_norm = np.full(num_objects, -np.inf, dtype=np.float32)
+        self.effective_horizon = 1 / (1 - discount)
+        self.discount = discount
+        self.v_max = v_max
+        self.target_entropy = target_entropy
+        self._slot_rewards = [[] for _ in range(num_slots)]
+
+    def _calculate_returns(self, rewards_traj: np.ndarray, truncate: bool):
+        values = np.zeros_like(rewards_traj)
+        bootstrap = rewards_traj.mean() * self.effective_horizon if truncate else 0.0
+        for i in reversed(range(rewards_traj.shape[0])):
+            values[i] = rewards_traj[i] + self.discount * bootstrap
+            bootstrap = values[i]
+        return values.min(), values.max()
+
+    def update(self, rewards: np.ndarray, terminal: np.ndarray, truncate: np.ndarray):
+        for i in range(self._num_slots):
+            self._slot_rewards[i].append(rewards[i])
+        done = np.logical_or(terminal, truncate)
+        if done.any():
+            for j in done.nonzero()[0]:
+                obj_id = self._slot_to_object[j]
+                rewards_traj = np.asarray(self._slot_rewards[j])
+                v_min, v_max = self._calculate_returns(rewards_traj, truncate[j])
+                self.returns_min_norm[obj_id] = min(self.returns_min_norm[obj_id], v_min)
+                self.returns_max_norm[obj_id] = max(self.returns_max_norm[obj_id], v_max)
+                self._slot_rewards[j] = []
+
+    def normalize(self, batches: Batch, temperature: np.ndarray):
+        denominator = np.where(
+            self.returns_max_norm > np.abs(self.returns_min_norm),
+            self.returns_max_norm, np.abs(self.returns_min_norm),
+        )
+        denominator = (denominator - temperature * self.effective_horizon * self.target_entropy / 2) / self.v_max
+        denominator = denominator[batches.task_ids]
+        rewards = batches.rewards / denominator
+        return Batch(
+            observations=batches.observations, actions=batches.actions,
+            rewards=rewards, masks=batches.masks,
+            next_observations=batches.next_observations, task_ids=batches.task_ids,
+        )
