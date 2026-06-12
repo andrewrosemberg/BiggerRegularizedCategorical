@@ -331,6 +331,6 @@ class BRC(object):
         
     def load(self, path):
         self.actor = self.actor.load(f'{path}/actor.txt')
-        self.critic = self.actor.load(f'{path}/critic.txt')
-        self.target_critic = self.actor.load(f'{path}/target_critic.txt')
-        self.temp = self.actor.load(f'{path}/temp.txt')
+        self.critic = self.critic.load(f'{path}/critic.txt')
+        self.target_critic = self.target_critic.load(f'{path}/target_critic.txt')
+        self.temp = self.temp.load(f'{path}/temp.txt')
